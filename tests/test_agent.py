@@ -429,5 +429,67 @@ async def test_thinking_event_emitted_before_stream():
     agent = Agent(_make_config(), client)
     events = [ev async for ev in agent.run("hi")]
     types = [e.type for e in events]
-    # step comes before thinking comes before content_delta
-    assert types.index("step") < types.index("thinking") < types.index("content_delta")
+    # step comes before stage=thinking comes before content_delta
+    assert types.index("step") < types.index("stage") < types.index("content_delta")
+
+
+@pytest.mark.asyncio
+async def test_stage_transitions_full_cycle(tmp_path, monkeypatch):
+    """Stage should flow: connecting → thinking → streaming → tools → done."""
+    from harness.llm import StreamEvent
+    from harness import tools
+
+    # Set up a real working directory with x.py so read_file works
+    (tmp_path / "x.py").write_text("print('hi')")
+    monkeypatch.setenv("AI_WORKDIR", str(tmp_path))
+    tools.WORKDIR = tmp_path.resolve()
+
+    call_n = {"n": 0}
+
+    async def fake_stream_with_tools(messages, system):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            yield StreamEvent(type="content", text="Reading...")
+            yield StreamEvent(type="tool_call", id="c1", name="read_file",
+                              arguments={"path": "x.py"})
+            yield StreamEvent(type="done", usage={"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55})
+        else:
+            yield StreamEvent(type="done", usage={"prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23})
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream_with_tools,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("read x")]
+    stages = [e.payload["stage"] for e in events if e.type == "stage"]
+    # Should see thinking → streaming → tools → finalizing (or done)
+    assert "thinking" in stages
+    assert "streaming" in stages
+    assert "tools" in stages
+
+
+@pytest.mark.asyncio
+async def test_streaming_event_transitions_to_streaming_stage():
+    """When the first content_delta arrives, stage transitions to 'streaming'."""
+    from harness.llm import StreamEvent
+
+    async def fake_stream(messages, system):
+        # Add a small delay before first token to simulate TTFT
+        import asyncio as _a
+        await _a.sleep(0.01)
+        yield StreamEvent(type="content", text="hello")
+        yield StreamEvent(type="done", usage={})
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("hi")]
+    stage_events = [e for e in events if e.type == "stage"]
+    # First stage event = thinking, second = streaming (when first content arrived)
+    assert stage_events[0].payload["stage"] == "thinking"
+    assert any(e.payload["stage"] == "streaming" for e in stage_events)

@@ -75,6 +75,9 @@ class FlowState:
     dedup_hits: int = 0
     subagent_calls: int = 0
 
+    # Stage: connecting | thinking | streaming | tools | finalizing | done
+    stage: str = ""
+
     # Context used (last observed prompt_tokens)
     context_used: int = 0
 
@@ -107,12 +110,35 @@ class FlowState:
         self.externalized = 0
         self.dedup_hits = 0
         self.subagent_calls = 0
+        self.stage = ""
         self.context_used = 0
 
 
 def _trunc(s: str, n: int) -> str:
     s = s.replace("\n", " ").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# Stage configuration: spinner frames, color, label.
+_STAGES: dict[str, tuple[list[str], str, str]] = {
+    # stage_name: (spinner_frames, color, label)
+    "connecting": (["◌", "○", "◌", "·"], "yellow", "connecting"),
+    "thinking":   (["◐", "◓", "◑", "◒"], "yellow", "thinking"),
+    "streaming":  (["▎", "▌", "▊", "█"], "green", "streaming"),
+    "tools":      (["⚙", "⊙", "⊙", "⚙"], "cyan", "executing"),
+    "finalizing": (["▣", "▤", "▥", "▦"], "blue", "finalizing"),
+}
+
+
+def _stage_render(stage: str, elapsed: float) -> str:
+    """Return a rich-markup spinner string for the current stage and elapsed time."""
+    cfg = _STAGES.get(stage)
+    if not cfg:
+        return ""
+    frames, color, label = cfg
+    idx = int(elapsed * 6) % len(frames)
+    spin = frames[idx]
+    return f"[{color}]{spin} {label} {_fmt_time(elapsed)}[/{color}]"
 
 
 def _bar(fraction: float, length: int = 12) -> tuple[str, str]:
@@ -202,7 +228,17 @@ def _render_flow(s: FlowState) -> str:
     lines.append(blank())
     step_label = f"step {s.step}/{s.max_steps}" if s.max_steps else f"step {s.step}"
 
-    if s.is_thinking:
+    if s.stage and s.stage in _STAGES:
+        # Show stage + animated spinner
+        stage_render = _stage_render(s.stage, s.elapsed)
+        lines.append(row(f"[bold blue]AGENT[/bold blue] {step_label}"))
+        lines.append(row(f"  {stage_render}"))
+        if s.stage == "streaming" and s.last_ttft:
+            lines.append(row(
+                f"[dim]  ttft {_fmt_time(s.last_ttft)} · "
+                f"{s.avg_tokens_per_second:.0f} tok/s[/dim]"
+            ))
+    elif s.is_thinking:
         spinner = "◐◓◑◒"[int(s.elapsed * 4) % 4] if s.elapsed else "◐"
         lines.append(row(
             f"[bold blue]AGENT[/bold blue] {step_label} [yellow]{spinner}[/yellow]"

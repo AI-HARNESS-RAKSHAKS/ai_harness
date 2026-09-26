@@ -146,7 +146,7 @@ async def list_files(path: str = ".") -> str:
     return _postprocess("\n".join(entries) if entries else "(empty directory)", "list_files", tail=False)
 
 
-async def bash(command: str, timeout: int = 30) -> str:
+async def bash(command: str, timeout: int = 15) -> str:
     """Run a shell command. Output is tail-truncated and externalised if huge."""
     timeout = max(1, min(int(timeout), 120))
     try:

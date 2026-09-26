@@ -194,3 +194,52 @@ def test_cost_zero_displayed():
     s = _state(cost_total=0.0, cost_in=0.0, cost_out=0.0)
     out = _render_flow(s)
     assert "$0.0000" in out
+
+
+# --- stage rendering ---
+
+def test_stage_renders_label():
+    s = _state(stage="thinking", elapsed=1.5, step=2, max_steps=10)
+    out = _render_flow(s)
+    # Animated spinner for thinking stage
+    assert "thinking" in out
+    assert "1.5s" in out
+
+
+def test_stage_streaming_shows_ttft():
+    s = _state(stage="streaming", elapsed=3.0, step=2, max_steps=10,
+               last_ttft=0.4, avg_tokens_per_second=87.5)
+    out = _render_flow(s)
+    assert "streaming" in out
+    assert "ttft" in out
+    # 87.5 rounds to 88 with :.0f
+    assert "88 tok/s" in out
+
+
+def test_stage_tools():
+    s = _state(stage="tools", elapsed=4.0, step=2, max_steps=10,
+               pending_tools=["read_file"])
+    out = _render_flow(s)
+    assert "executing" in out
+
+
+def test_stage_finalizing():
+    s = _state(stage="finalizing", elapsed=5.0, step=3, max_steps=10)
+    out = _render_flow(s)
+    assert "finalizing" in out
+
+
+def test_stage_spinner_frames_advance_with_elapsed():
+    """Different elapsed values produce different spinner frames."""
+    from harness.flow import _stage_render
+    s = _state(stage="thinking", elapsed=0.0)
+    s.elapsed = 0.0
+    f0 = _stage_render("thinking", 0.0)
+    f2 = _stage_render("thinking", 0.5)  # ~3 frames later
+    assert f0 != f2  # spinner should have advanced
+
+
+def test_unknown_stage_renders_nothing():
+    from harness.flow import _stage_render
+    assert _stage_render("", 0) == ""
+    assert _stage_render("nonexistent", 0) == ""

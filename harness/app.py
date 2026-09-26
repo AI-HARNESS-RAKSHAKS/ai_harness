@@ -16,6 +16,9 @@ Layout:
 
 from __future__ import annotations
 
+import asyncio
+import time
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -107,6 +110,8 @@ class HarnessApp(App):
         self._busy = False
         self._flow_visible = True
         self._sidebar_docked = "right"
+        self._turn_started = 0.0
+        self._warmup_done = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
@@ -151,9 +156,44 @@ class HarnessApp(App):
             "[dim]Auto-retry: 408/409/425/429/500/502/503/504 (5 attempts, honours Retry-After).[/dim]"
         )
         log.write(
+            "[dim]Streaming on · Live timer · Animated stage indicators[/dim]"
+        )
+        log.write(
             "[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact · "
             "Ctrl+D hide flow · Ctrl+B dock bottom · Ctrl+C quit[/dim]\n"
         )
+
+        # Live elapsed-time ticker - refreshes the FlowPanel every 100ms
+        # while a turn is running, so the spinner / stage label animate
+        # even when nothing else changes.
+        self._tick = self.set_interval(0.1, self._tick_elapsed)
+
+        # Pre-warm the HTTP connection in the background so the first
+        # real request doesn't pay the DNS / TLS / auth handshake cost.
+        self._warmup_task = asyncio.create_task(self._warmup())
+
+    async def _warmup(self) -> None:
+        """Open the connection lazily. Doesn't send any tokens."""
+        try:
+            # httpx will lazy-connect on first request; nothing to do here
+            # except ensure the AsyncClient is alive. We don't ping the API
+            # because that would consume tokens.
+            _ = self.client._client
+        except Exception:
+            pass
+
+    def _tick_elapsed(self) -> None:
+        """Refresh the FlowPanel every 100ms during a turn so the spinner
+        animates and the elapsed counter advances even between LLM events.
+        """
+        if not self._busy or self._turn_started == 0.0:
+            return
+        self.flow_state.elapsed = time.monotonic() - self._turn_started
+        # If streaming, also estimate streaming elapsed for the live TTFT view
+        try:
+            self.query_one("#flow", FlowPanel).refresh()
+        except Exception:
+            pass
 
     # --- FlowPanel observer (runs synchronously, never raises) ---------------
 
@@ -171,6 +211,8 @@ class HarnessApp(App):
             s.finished_tools = []
             s.streaming_text = ""
             s.is_thinking = False
+            s.stage = "connecting"
+            s.elapsed = 0.0
         elif ev.type == "step":
             s.step = ev.payload.get("n", 0)
             s.max_steps = ev.payload.get("max", s.max_steps)
@@ -182,18 +224,26 @@ class HarnessApp(App):
             s.streaming_text = ""
             s.last_step_duration = 0.0
             s.is_thinking = False
+        elif ev.type == "stage":
+            s.stage = ev.payload.get("stage", "")
+            s.is_thinking = (s.stage == "thinking" or s.stage == "connecting")
+            if "elapsed" in ev.payload:
+                s.elapsed = ev.payload["elapsed"]
         elif ev.type == "thinking":
             s.is_thinking = True
+            s.stage = "thinking"
             s.streaming_text = ""
             s.elapsed = ev.payload.get("elapsed", s.elapsed)
         elif ev.type == "content_delta":
             s.is_thinking = False
+            s.stage = "streaming"
             text = ev.payload.get("text", "")
             s.streaming_text += text
             if len(s.streaming_text) > 1000:
                 s.streaming_text = "…" + s.streaming_text[-500:]
         elif ev.type == "assistant":
             s.is_thinking = False
+            s.stage = "finalizing"
             s.streaming_text = ""
             s.last_assistant = ev.payload.get("content", "")[:200]
             s.step_in = ev.payload.get("step_in", s.step_in)
@@ -219,9 +269,11 @@ class HarnessApp(App):
             s.final_answer = ev.payload.get("answer", "")
             s.pending_tools = []
             s.is_thinking = False
+            s.stage = "done"
         elif ev.type == "error":
             s.error = ev.payload.get("message", "error")
             s.is_thinking = False
+            s.stage = "error"
 
         s.total_in = self.agent.usage.input_tokens
         s.total_out = self.agent.usage.output_tokens
@@ -251,6 +303,7 @@ class HarnessApp(App):
 
     async def _handle_user_input(self, text: str) -> None:
         self._busy = True
+        self._turn_started = time.monotonic()
         log = self.query_one("#log", RichLog)
         log.write(f"[bold green]>[/bold green] {text}")
 
@@ -263,11 +316,18 @@ class HarnessApp(App):
         ext = self.agent.externalized_count
         ext_note = f"  · externalized: {ext}" if ext else ""
         cost = getattr(self.agent, "_cost_total", 0.0)
+        dur = time.monotonic() - self._turn_started
         log.write(
-            f"[dim]↳ {self.agent.usage.summary()} · ${cost:.4f}{ext_note}[/dim]\n"
+            f"[dim]↳ {self.agent.usage.summary()} · ${cost:.4f} · {dur:.1f}s{ext_note}[/dim]\n"
         )
         self._busy = False
+        self._turn_started = 0.0
         self.query_one("#status", Static).update(self._status_text("ready"))
+        self.flow_state.stage = "done"
+        try:
+            self.query_one("#flow", FlowPanel).refresh()
+        except Exception:
+            pass
 
     async def _render_event(self, ev: AgentEvent) -> None:
         log = self.query_one("#log", RichLog)

@@ -37,28 +37,18 @@ from .pricing import estimate_cost
 from .tools import DONE_MARKER, execute_tool
 
 
-SYSTEM_PROMPT = """You are AI Harness, a coding agent that operates inside a Textual TUI.
+SYSTEM_PROMPT = """Coding agent. Use tools to act on the working directory.
 
-You have exactly these tools available:
-- read_file(path)             read a file (output auto-truncated; huge outputs externalised)
-- write_file(path, content)   write content to a file (overwrites existing)
-- edit_file(path, old_string, new_string, replace_all=false)   in-place edit
-- list_files(path=".")        list a directory (head-truncated)
-- bash(command, timeout=30)   run a shell command (errors tail-kept)
-- task(prompt, subagent_type="general", max_turns=N)
-                                spawn an isolated sub-agent for a bounded subtask
-- done(answer)                finish and report the final answer
+Tools (terse names):
+- read_file(path)             read a file (truncated; large externalised)
+- write_file(path, content)   write a file (overwrites)
+- edit_file(p, old, new, rep=false)  in-place edit
+- list_files(path=".")        list a dir
+- bash(command, timeout=15)   run shell (errors tail-kept)
+- task(prompt, subagent_type="general")  isolated sub-agent
+- done(answer)                finish
 
-Rules of engagement:
-1. EXPLORE FIRST. Use list_files then read_file before any edit. Never guess file contents.
-2. PREFER edit_file OVER write_file for existing files - it is safer and avoids full-file re-sends.
-3. KEEP BASH COMMANDS SMALL AND FOCUSED. No destructive operations (no rm -rf, no git push, no installs without need).
-4. DELEGATE bounded subtasks with task() instead of doing everything yourself.
-5. BE CONCISE. No narration, no "let me think about this" prose. The user sees only your tool calls + done summary.
-6. LARGE OUTPUTS: anything over a few KB is auto-externalised. The tool result tells you the path; call read_file if you need the full content.
-7. WHEN THE TASK IS COMPLETE, call done(answer) with a short summary of what you did.
-
-You will be told the budget (cumulative token cap) and the max steps in the system context. Do not exceed either."""
+Rules: explore first (list_files then read_file). Prefer edit_file over write_file. Small bash only - no destructive ops (no rm -rf, no git push). Delegate via task() for bounded subtasks. Be terse - no narration. Large outputs are auto-externalised; read_file the path if you need full content. Call done when the task is complete."""
 
 
 SUBAGENT_SYSTEM_PROMPT = """You are a focused sub-agent spawned by a parent agent.
@@ -149,6 +139,7 @@ class Agent:
         self.last_ttft: float = 0.0  # time-to-first-token for the most recent step
         self.step_token_rates: list[float] = []  # tok/s per step
         self.streaming: bool = True  # streaming on by default for snappy UX
+        self._streaming_started: bool = False  # per-step state
 
     def _emit(self, ev: AgentEvent) -> None:
         if self.observer is not None:
@@ -198,8 +189,8 @@ class Agent:
             yield ev
             self._emit(ev)
 
-            # "Thinking" event so the UI shows a spinner immediately
-            ev = AgentEvent("thinking", {"elapsed": 0.0})
+            # Stage: thinking - waiting for first token from LLM
+            ev = AgentEvent("stage", {"stage": "thinking", "elapsed": 0.0})
             yield ev
             self._emit(ev)
 
@@ -209,8 +200,19 @@ class Agent:
             # doesn't support it (rare but possible).
             try:
                 async for ev in self._stream_response(model_messages):
+                    # When first content arrives, transition to 'streaming'
+                    if ev.type == "content_delta" and not self._streaming_started:
+                        self._streaming_started = True
+                        stage_ev = AgentEvent("stage", {
+                            "stage": "streaming",
+                            "elapsed": time.monotonic() - step_start,
+                        })
+                        yield stage_ev
+                        self._emit(stage_ev)
                     yield ev
                     self._emit(ev)
+                # Reset for next step
+                self._streaming_started = False
             except Exception as exc:
                 ev = AgentEvent("error", {"message": f"LLM call failed: {exc}"})
                 yield ev
@@ -231,7 +233,6 @@ class Agent:
             step_out = int(result["usage"].get("completion_tokens") or 0)
             step_cached = int((result["usage"].get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
 
-            # Compute cost for this step
             step_cost_in, step_cost_out, step_cost_total = estimate_cost(
                 self.config.model, step_in, step_out, step_cached
             )
@@ -279,6 +280,9 @@ class Agent:
             self._emit(ev)
 
             if not tool_calls:
+                ev = AgentEvent("stage", {"stage": "finalizing"})
+                yield ev
+                self._emit(ev)
                 ev = AgentEvent("done", {"answer": accumulated_content})
                 yield ev
                 self._emit(ev)
@@ -307,6 +311,14 @@ class Agent:
                 )
                 yield ev
                 self._emit(ev)
+
+            # Stage: tools - about to execute
+            ev = AgentEvent("stage", {
+                "stage": "tools",
+                "elapsed": time.monotonic() - self.turn_started,
+            })
+            yield ev
+            self._emit(ev)
 
             for tc, name, args in parsed_calls:
                 should_stop, reason = self.loop_detector.check(name, args)
@@ -359,6 +371,9 @@ class Agent:
                 })
 
             if done_answer is not None:
+                ev = AgentEvent("stage", {"stage": "finalizing"})
+                yield ev
+                self._emit(ev)
                 ev = AgentEvent("done", {"answer": done_answer})
                 yield ev
                 self._emit(ev)
