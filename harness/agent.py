@@ -8,6 +8,8 @@ Optimised for low token/cost:
 - Two-layer loop detection.
 - Sub-agent spawning via the ``task`` tool with isolated context.
 - Per-step timing + cost accumulation for the FlowPanel.
+- Streaming: text deltas yield live as the model generates
+  (time-to-first-token visible in FlowPanel).
 
 A ``FlowObserver`` callback can be attached to receive lightweight updates
 for visualisation (UI panels, logs, etc.) without coupling the agent to
@@ -76,6 +78,18 @@ class AgentEvent:
     payload: dict = field(default_factory=dict)
 
 
+# Event types:
+#   user            - user submitted an input
+#   step            - new agent step started
+#   thinking        - model is generating, waiting for first token
+#   content_delta   - one text chunk arrived (streaming)
+#   assistant       - full assistant message (final, after stream)
+#   tool_call       - tool was requested
+#   tool_result     - tool finished
+#   done            - agent finished
+#   error           - something failed
+
+
 @dataclass
 class TokenUsage:
     input_tokens: int = 0
@@ -132,7 +146,9 @@ class Agent:
         # Timing
         self.turn_started: float = 0.0
         self.last_step_duration: float = 0.0
+        self.last_ttft: float = 0.0  # time-to-first-token for the most recent step
         self.step_token_rates: list[float] = []  # tok/s per step
+        self.streaming: bool = True  # streaming on by default for snappy UX
 
     def _emit(self, ev: AgentEvent) -> None:
         if self.observer is not None:
@@ -152,6 +168,7 @@ class Agent:
         self.subagent_calls = 0
         self.turn_started = 0.0
         self.last_step_duration = 0.0
+        self.last_ttft = 0.0
         self.step_token_rates = []
 
     async def run(self, user_input: str) -> AsyncIterator[AgentEvent]:
@@ -181,31 +198,43 @@ class Agent:
             yield ev
             self._emit(ev)
 
+            # "Thinking" event so the UI shows a spinner immediately
+            ev = AgentEvent("thinking", {"elapsed": 0.0})
+            yield ev
+            self._emit(ev)
+
             model_messages = elide_superseded_writes(self.messages)
 
+            # Stream the response. Fall back to non-streaming if the provider
+            # doesn't support it (rare but possible).
             try:
-                completion = await self.client.chat(model_messages, system=SYSTEM_PROMPT)
+                async for ev in self._stream_response(model_messages):
+                    yield ev
+                    self._emit(ev)
             except Exception as exc:
                 ev = AgentEvent("error", {"message": f"LLM call failed: {exc}"})
                 yield ev
                 self._emit(ev)
                 return
 
+            result = self._stream_result
+            accumulated_content = result["content"]
+            tool_calls = result["tool_calls"]
+
             step_duration = time.monotonic() - step_start
             self.last_step_duration = step_duration
 
-            self.usage.add(completion.usage)
-            self.budget.add(int(completion.usage.get("total_tokens") or 0))
+            self.usage.add(result["usage"])
+            self.budget.add(int(result["usage"].get("total_tokens") or 0))
 
-            step_in = int(completion.usage.get("prompt_tokens") or 0)
-            step_out = int(completion.usage.get("completion_tokens") or 0)
-            step_cached = int((completion.usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+            step_in = int(result["usage"].get("prompt_tokens") or 0)
+            step_out = int(result["usage"].get("completion_tokens") or 0)
+            step_cached = int((result["usage"].get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
 
             # Compute cost for this step
             step_cost_in, step_cost_out, step_cost_total = estimate_cost(
                 self.config.model, step_in, step_out, step_cached
             )
-            # Accumulate cost in usage via a sidecar dict
             if not hasattr(self, "_cost_in"):
                 self._cost_in = 0.0
                 self._cost_out = 0.0
@@ -214,7 +243,6 @@ class Agent:
             self._cost_out += step_cost_out
             self._cost_total += step_cost_total
 
-            # Tokens per second for this step
             tps = step_out / step_duration if step_duration > 0 else 0.0
             self.step_token_rates.append(tps)
             avg_tps = (
@@ -223,11 +251,7 @@ class Agent:
                 else 0.0
             )
 
-            msg = completion.message
-            content = (msg.get("content") or "").strip()
-            tool_calls = msg.get("tool_calls")
-
-            history_msg: dict = {"role": "assistant", "content": msg.get("content") or ""}
+            history_msg: dict = {"role": "assistant", "content": accumulated_content}
             if tool_calls:
                 history_msg["tool_calls"] = tool_calls
             self.messages.append(history_msg)
@@ -235,7 +259,7 @@ class Agent:
             ev = AgentEvent(
                 "assistant",
                 {
-                    "content": content,
+                    "content": accumulated_content,
                     "step_in": step_in,
                     "step_out": step_out,
                     "step_cached": step_cached,
@@ -243,20 +267,19 @@ class Agent:
                     "tokens_per_second": tps,
                     "avg_tokens_per_second": avg_tps,
                     "elapsed": time.monotonic() - self.turn_started,
+                    "ttft": self.last_ttft,
                     "step_cost": step_cost_total,
                     "cost_in": self._cost_in,
                     "cost_out": self._cost_out,
                     "cost_total": self._cost_total,
+                    "streamed": self.streaming,
                 },
             )
             yield ev
             self._emit(ev)
 
-            if content:
-                pass  # content rendered via event above
-
             if not tool_calls:
-                ev = AgentEvent("done", {"answer": msg.get("content") or ""})
+                ev = AgentEvent("done", {"answer": accumulated_content})
                 yield ev
                 self._emit(ev)
                 return
@@ -266,7 +289,11 @@ class Agent:
                 fn = tc.get("function") or {}
                 name = fn.get("name", "")
                 try:
-                    args = json.loads(fn.get("arguments") or "{}")
+                    args_raw = fn.get("arguments") or "{}"
+                    if isinstance(args_raw, dict):
+                        args = args_raw
+                    else:
+                        args = json.loads(args_raw)
                 except json.JSONDecodeError:
                     args = {}
                 if not isinstance(args, dict):
@@ -343,6 +370,61 @@ class Agent:
         )
         yield ev
         self._emit(ev)
+
+    async def _stream_response(self, model_messages):
+        """Stream a chat completion, yielding content_delta events.
+
+        Also mutates ``self._stream_result`` with the final content,
+        tool_calls, and usage. Callers should read ``self._stream_result``
+        after iterating this generator.
+
+        Falls back to non-streaming ``chat()`` if the client doesn't expose
+        ``chat_stream`` (e.g. legacy clients or test mocks).
+        """
+        self._stream_result = {"content": "", "tool_calls": [], "usage": {}}
+        first_token_at: float | None = None
+        used_streaming = False
+
+        stream_fn = getattr(self.client, "chat_stream", None)
+        if stream_fn is None:
+            # Client has no streaming support - go straight to batch mode.
+            self.streaming = False
+            completion = await self.client.chat(model_messages, system=SYSTEM_PROMPT)
+            msg = completion.message
+            self._stream_result["content"] = msg.get("content") or ""
+            self._stream_result["tool_calls"] = msg.get("tool_calls") or []
+            self._stream_result["usage"] = completion.usage or {}
+            return
+
+        try:
+            async for ev in stream_fn(model_messages, system=SYSTEM_PROMPT):
+                if ev.type == "content":
+                    if first_token_at is None:
+                        first_token_at = time.monotonic()
+                        self.last_ttft = first_token_at - self.turn_started
+                    self._stream_result["content"] += ev.text
+                    used_streaming = True
+                    yield AgentEvent("content_delta", {"text": ev.text})
+                elif ev.type == "tool_call":
+                    self._stream_result["tool_calls"].append({
+                        "id": ev.id,
+                        "type": "function",
+                        "function": {
+                            "name": ev.name,
+                            "arguments": json.dumps(ev.arguments),
+                        },
+                    })
+                elif ev.type == "done":
+                    self._stream_result["usage"] = ev.usage or {}
+            self.streaming = used_streaming
+        except Exception:
+            # Streaming failed at runtime - fall back to batch.
+            self.streaming = False
+            completion = await self.client.chat(model_messages, system=SYSTEM_PROMPT)
+            msg = completion.message
+            self._stream_result["content"] = msg.get("content") or ""
+            self._stream_result["tool_calls"] = msg.get("tool_calls") or []
+            self._stream_result["usage"] = completion.usage or {}
 
     async def _execute_one(self, name: str, args: dict, tc_id: str) -> str:
         if name in ("read_file", "list_files"):
@@ -428,3 +510,10 @@ class Agent:
         if len(head) + len(tail) >= len(self.messages):
             return
         self.messages = head + tail
+
+
+@dataclass
+class _StreamedResponse:
+    content: str
+    tool_calls: list
+    usage: dict

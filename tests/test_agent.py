@@ -289,3 +289,145 @@ async def test_dedup_caches_repeated_reads(tmp_path, monkeypatch):
         assert calls == ["x.py"], f"read_file invoked {calls}, expected only ['x.py']"
     finally:
         tools._TOOL_FUNCS["read_file"] = real_read
+
+
+# ---- streaming -----------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_streaming_emits_content_delta_events():
+    """When streaming works, content_delta events arrive with chunks of text."""
+    from harness.llm import StreamEvent
+
+    async def fake_stream(messages, system):
+        yield StreamEvent(type="content", text="Hello ")
+        yield StreamEvent(type="content", text="world!")
+        yield StreamEvent(type="done", finish_reason="stop", usage={
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+        })
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("hi")]
+
+    # content_delta events should fire
+    deltas = [e for e in events if e.type == "content_delta"]
+    assert len(deltas) == 2
+    assert deltas[0].payload["text"] == "Hello "
+    assert deltas[1].payload["text"] == "world!"
+    # assistant event at the end with full content
+    assistant = [e for e in events if e.type == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0].payload["content"] == "Hello world!"
+
+
+@pytest.mark.asyncio
+async def test_streaming_records_ttft():
+    """Time-to-first-token should be captured and non-zero."""
+    import asyncio
+    from harness.llm import StreamEvent
+
+    async def fake_stream(messages, system):
+        await asyncio.sleep(0.05)  # simulate model "thinking"
+        yield StreamEvent(type="content", text="ok")
+        yield StreamEvent(type="done", usage={
+            "prompt_tokens": 10, "completion_tokens": 1, "total_tokens": 11,
+        })
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    async for ev in agent.run("hi"):
+        if ev.type == "assistant":
+            ttft = ev.payload.get("ttft", 0)
+            assert ttft > 0
+            assert ttft < 1.0  # should be quick in test
+
+
+@pytest.mark.asyncio
+async def test_streaming_falls_back_to_batch_on_error():
+    """If streaming fails, fall back to non-streaming chat()."""
+    from harness.llm import StreamEvent
+
+    async def broken_stream(messages, system):
+        raise RuntimeError("streaming not supported")
+        yield  # never reached  # noqa
+
+    success_completion = _completion(content="batch response")
+
+    client = SimpleNamespace(
+        chat_stream=broken_stream,
+        chat=AsyncMock(return_value=success_completion),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("hi")]
+    done = [e for e in events if e.type == "done"]
+    assert len(done) == 1
+    assert "batch response" in done[0].payload["answer"]
+    assert agent.streaming is False  # marked as non-streaming
+
+
+@pytest.mark.asyncio
+async def test_streaming_with_tool_calls():
+    """Streaming should still surface tool calls correctly."""
+    from harness.llm import StreamEvent
+
+    call_n = {"n": 0}
+
+    async def fake_stream(messages, system):
+        call_n["n"] += 1
+        if call_n["n"] == 1:
+            yield StreamEvent(type="content", text="Reading...")
+            yield StreamEvent(
+                type="tool_call",
+                id="call_1",
+                name="read_file",
+                arguments={"path": "x.py"},
+            )
+            yield StreamEvent(type="done", usage={
+                "prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55,
+            })
+        else:
+            # Second call: done with answer
+            yield StreamEvent(type="done", usage={
+                "prompt_tokens": 20, "completion_tokens": 3, "total_tokens": 23,
+            })
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("read x.py")]
+    tool_call_events = [e for e in events if e.type == "tool_call"]
+    assert len(tool_call_events) == 1
+    assert tool_call_events[0].payload["name"] == "read_file"
+
+
+@pytest.mark.asyncio
+async def test_thinking_event_emitted_before_stream():
+    """A 'thinking' event fires immediately after 'step' so the UI shows a spinner."""
+    from harness.llm import StreamEvent
+
+    async def fake_stream(messages, system):
+        yield StreamEvent(type="content", text="hi")
+        yield StreamEvent(type="done", usage={})
+
+    client = SimpleNamespace(
+        chat_stream=fake_stream,
+        chat=AsyncMock(),
+        aclose=AsyncMock(),
+    )
+    agent = Agent(_make_config(), client)
+    events = [ev async for ev in agent.run("hi")]
+    types = [e.type for e in events]
+    # step comes before thinking comes before content_delta
+    assert types.index("step") < types.index("thinking") < types.index("content_delta")

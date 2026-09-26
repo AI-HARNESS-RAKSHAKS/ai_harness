@@ -103,11 +103,13 @@ class HarnessApp(App):
         b = self.agent.budget
         pct = int(b.fraction * 100)
         cost = getattr(self.agent, "_cost_total", 0.0)
+        mode = "stream" if self.agent.streaming else "batch"
         return (
             f"model: {self.config.model}   "
             f"tokens: in {u.input_tokens} (cached {u.cached_input_tokens}) | out {u.output_tokens}   "
             f"cost: ${cost:.4f}   "
             f"budget: {b.used}/{b.limit} ({pct}%)   "
+            f"mode: {mode}   "
             f"state: {state}"
         )
 
@@ -138,6 +140,7 @@ class HarnessApp(App):
             s.pending_tools = []
             s.finished_tools = []
             s.streaming_text = ""
+            s.is_thinking = False
         elif ev.type == "step":
             s.step = ev.payload.get("n", 0)
             s.max_steps = ev.payload.get("max", s.max_steps)
@@ -148,18 +151,35 @@ class HarnessApp(App):
             s.finished_tools = []
             s.streaming_text = ""
             s.last_step_duration = 0.0
+            s.is_thinking = False
+        elif ev.type == "thinking":
+            s.is_thinking = True
+            s.streaming_text = ""
+            s.elapsed = ev.payload.get("elapsed", s.elapsed)
+        elif ev.type == "content_delta":
+            s.is_thinking = False
+            text = ev.payload.get("text", "")
+            s.streaming_text += text
+            # Cap at 500 chars to avoid runaway memory on long streams
+            if len(s.streaming_text) > 1000:
+                s.streaming_text = "…" + s.streaming_text[-500:]
         elif ev.type == "assistant":
+            s.is_thinking = False
+            s.streaming_text = ""
             s.last_assistant = ev.payload.get("content", "")[:200]
             s.step_in = ev.payload.get("step_in", s.step_in)
             s.step_out = ev.payload.get("step_out", s.step_out)
             s.step_cached = ev.payload.get("step_cached", s.step_cached)
             s.last_step_duration = ev.payload.get("step_duration", s.last_step_duration)
+            s.last_ttft = ev.payload.get("ttft", s.last_ttft)
             s.avg_tokens_per_second = ev.payload.get("avg_tokens_per_second", s.avg_tokens_per_second)
             s.elapsed = ev.payload.get("elapsed", s.elapsed)
+            s.is_streaming = ev.payload.get("streamed", s.is_streaming)
             s.cost_in = ev.payload.get("cost_in", s.cost_in)
             s.cost_out = ev.payload.get("cost_out", s.cost_out)
             s.cost_total = ev.payload.get("cost_total", s.cost_total)
         elif ev.type == "tool_call":
+            s.is_thinking = False
             name = ev.payload.get("name", "")
             s.pending_tools.append(name)
         elif ev.type == "tool_result":
@@ -169,8 +189,10 @@ class HarnessApp(App):
         elif ev.type == "done":
             s.final_answer = ev.payload.get("answer", "")
             s.pending_tools = []
+            s.is_thinking = False
         elif ev.type == "error":
             s.error = ev.payload.get("message", "error")
+            s.is_thinking = False
 
         # Pull aggregate counters from the agent
         s.total_in = self.agent.usage.input_tokens
@@ -182,7 +204,6 @@ class HarnessApp(App):
         s.externalized = self.agent.externalized_count
         s.dedup_hits = self.agent.dedup_hits
         s.subagent_calls = self.agent.subagent_calls
-        # context_used = last observed prompt_tokens (most accurate we have)
         if self.agent.usage.input_tokens > 0:
             s.context_used = self.agent.usage.input_tokens
 

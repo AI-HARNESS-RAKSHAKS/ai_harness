@@ -46,8 +46,11 @@ class FlowState:
     step_out: int = 0
     step_cached: int = 0
     last_step_duration: float = 0.0
+    last_ttft: float = 0.0  # time-to-first-token
     avg_tokens_per_second: float = 0.0
     elapsed: float = 0.0
+    is_thinking: bool = False
+    is_streaming: bool = True
 
     # Recent activity
     last_assistant: str = ""
@@ -82,8 +85,11 @@ class FlowState:
         self.step_out = 0
         self.step_cached = 0
         self.last_step_duration = 0.0
+        self.last_ttft = 0.0
         self.avg_tokens_per_second = 0.0
         self.elapsed = 0.0
+        self.is_thinking = False
+        self.is_streaming = True
         self.last_assistant = ""
         self.pending_tools = []
         self.finished_tools = []
@@ -176,13 +182,27 @@ def _render_flow(s: FlowState) -> str:
     in_tok = f"{s.step_in:,}" if s.step_in else "—"
     out_tok = f"{s.step_out:,}" if s.step_out else "—"
     cached_tok = f" (cached {s.step_cached:,})" if s.step_cached else ""
-    lines.append(
-        f"[bold cyan]│[/bold cyan]  [bold blue]AGENT[/bold blue]  ── {step_label} ──▶"
-    )
-    lines.append(
-        f"[bold cyan]│[/bold cyan]        [dim]in: {in_tok}{cached_tok} tok · out: {out_tok} tok · "
-        f"{_fmt_time(s.last_step_duration)}[/dim]"
-    )
+
+    # Show thinking spinner or step info
+    if s.is_thinking:
+        spinner = "◐◓◑◒"[int(s.elapsed * 4) % 4] if s.elapsed else "◐"
+        lines.append(
+            f"[bold cyan]│[/bold cyan]  [bold blue]AGENT[/bold blue]  ── {step_label} "
+            f"[yellow]{spinner} thinking...[/yellow] ──▶"
+        )
+        lines.append(
+            f"[bold cyan]│[/bold cyan]        [dim]waiting for first token · "
+            f"{_fmt_time(s.elapsed)}[/dim]"
+        )
+    else:
+        lines.append(
+            f"[bold cyan]│[/bold cyan]  [bold blue]AGENT[/bold blue]  ── {step_label} ──▶"
+        )
+        ttft_str = f" · ttft {_fmt_time(s.last_ttft)}" if s.last_ttft else ""
+        lines.append(
+            f"[bold cyan]│[/bold cyan]        [dim]in: {in_tok}{cached_tok} tok · out: {out_tok} tok · "
+            f"{_fmt_time(s.last_step_duration)}{ttft_str}[/dim]"
+        )
 
     # LLM
     lines.append("[bold cyan]│[/bold cyan]        [dim]│[/dim]")
@@ -194,9 +214,16 @@ def _render_flow(s: FlowState) -> str:
     if base:
         lines.append(f"[bold cyan]│[/bold cyan]        [dim]↳ {base}[/dim]")
 
-    # streaming text or assistant text
-    if s.streaming_text:
-        lines.append(f"[bold cyan]│[/bold cyan]        [dim]streaming:[/dim] \"{_trunc(s.streaming_text, 60)}\"")
+    # streaming text or assistant text or thinking placeholder
+    if s.is_streaming and s.streaming_text:
+        lines.append(
+            f"[bold cyan]│[/bold cyan]        [green]▍ streaming:[/green] "
+            f"\"{_trunc(s.streaming_text, 60)}\""
+        )
+    elif s.is_thinking:
+        lines.append(
+            f"[bold cyan]│[/bold cyan]        [yellow]▍ generating...[/yellow]"
+        )
     elif s.last_assistant:
         lines.append(
             f"[bold cyan]│[/bold cyan]        [dim]assistant:[/dim] \"{_trunc(s.last_assistant, 60)}\""
@@ -274,10 +301,12 @@ def _render_flow(s: FlowState) -> str:
         )
 
     # speed row
+    ttft_info = f" · ttft: {_fmt_time(s.last_ttft)}" if s.last_ttft else ""
+    mode = "streaming" if s.is_streaming else "batch"
     lines.append(
         f"[bold cyan]│[/bold cyan]  [dim]speed    avg: {s.avg_tokens_per_second:.0f} tok/s · "
-        f"last step: {_fmt_time(s.last_step_duration)} · "
-        f"elapsed: {_fmt_time(s.elapsed)}[/dim]"
+        f"last step: {_fmt_time(s.last_step_duration)}{ttft_info} · "
+        f"elapsed: {_fmt_time(s.elapsed)} · {mode}[/dim]"
     )
 
     # misc row
