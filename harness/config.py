@@ -29,12 +29,31 @@ class Config:
     tombstone_recent_tools: int = 2
 
 
+def _load_dotenv_if_present() -> None:
+    """Best-effort loader for local .env without third-party dependencies."""
+    env_file = os.path.join(os.getcwd(), ".env")
+    if os.path.isfile(env_file):
+        try:
+            with open(env_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k = k.strip()
+                        v = v.strip().strip("'\"")
+                        if k and k not in os.environ:
+                            os.environ[k] = v
+        except Exception:
+            pass
+
+
 def load_config() -> Config:
     """Build a Config from environment variables.
 
     `AI_API_KEY` is mandatory; everything else falls back to defaults tuned
     for low token usage and cost.
     """
+    _load_dotenv_if_present()
     api_key = os.environ.get("AI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(

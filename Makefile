@@ -4,6 +4,9 @@ PYTHON ?= python3
 VENV   := .venv
 BIN    := $(VENV)/bin
 
+-include .env
+export
+
 help:
 	@echo "AI Harness - available targets:"
 	@echo "  setup   - create virtualenv and install dependencies"
