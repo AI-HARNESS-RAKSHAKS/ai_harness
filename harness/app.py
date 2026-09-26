@@ -134,6 +134,7 @@ class HarnessApp(App):
         self._last_indicator_text = ""
         self._warmup_done = False
         self._warmup_start = 0.0
+        self._answer_already_shown = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
@@ -385,6 +386,7 @@ class HarnessApp(App):
     async def _handle_user_input(self, text: str) -> None:
         self._busy = True
         self._turn_started = time.monotonic()
+        self._answer_already_shown = False
         log = self.query_one("#log", RichLog)
         log.write(f"[bold green]>[/bold green] {text}")
 
@@ -428,6 +430,7 @@ class HarnessApp(App):
         if ev.type == "assistant":
             content = ev.payload["content"].strip()
             if content:
+                from rich.markup import escape
                 dur = ev.payload.get("step_duration", 0.0)
                 tok = ev.payload.get("step_out", 0)
                 tps = ev.payload.get("tokens_per_second", 0.0)
@@ -437,13 +440,25 @@ class HarnessApp(App):
                 ttft_s = f"{int(ttft * 1000)}ms" if ttft else "—"
                 log.write(
                     f"[bold magenta]assistant[/bold magenta] "
-                    f"[dim]({dur_s} · ttft {ttft_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{content}"
+                    f"[dim]({dur_s} · ttft {ttft_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]"
                 )
+                log.write(f"[bold]{escape(content)}[/bold]")
+                self._answer_already_shown = True
             return
         if ev.type == "tool_call":
             name = ev.payload["name"]
             args = ev.payload["arguments"]
-            args_str = ", ".join(f"{k}={repr(v)[:60]}" for k, v in args.items())
+            # When the model calls done() tool directly, surface the
+            # answer as the assistant message (some models like Qwen
+            # skip the streamed text and put the answer in tool args).
+            if name == "done":
+                answer = args.get("answer", "")
+                if isinstance(answer, str) and answer.strip():
+                    from rich.markup import escape
+                    log.write(f"[bold magenta]assistant[/bold magenta] [dim](via done tool)[/dim]")
+                    log.write(f"[bold green]{escape(answer.strip())}[/bold green]")
+                    self._answer_already_shown = True
+                return
             if name == "task":
                 log.write(
                     f"[bold yellow]⚙ task[/bold yellow] "
@@ -451,10 +466,14 @@ class HarnessApp(App):
                     f"prompt={repr(args.get('prompt', ''))[:80]}...)[/dim]"
                 )
             else:
+                args_str = ", ".join(f"{k}={repr(v)[:60]}" for k, v in args.items())
                 log.write(f"[bold yellow]⚙ {name}[/bold yellow] [dim]({args_str})[/dim]")
             return
         if ev.type == "tool_result":
             output = ev.payload["output"]
+            # Suppress the "(task completed)" placeholder - it's noise.
+            if isinstance(output, str) and output == "(task completed)":
+                return
             sz = ev.payload.get("size", 0)
             externalized = isinstance(output, str) and output.startswith("[externalized:")
             label = "↳ externalized →" if externalized else f"↳ output ({sz} chars)"
@@ -463,7 +482,13 @@ class HarnessApp(App):
                 log.write(f"    {line}")
             return
         if ev.type == "done":
-            log.write(f"[bold cyan]✓ done[/bold cyan] [dim]{ev.payload.get('answer', '')}[/dim]")
+            # done event: render the answer prominently on its own line
+            # (the tool_call 'done' branch above already showed it for
+            # tool-based finishes; this also covers batch-mode finishes).
+            answer = ev.payload.get('answer', '').strip()
+            if answer and not self._answer_already_shown:
+                from rich.markup import escape
+                log.write(f"[bold green]{escape(answer)}[/bold green]")
             return
         if ev.type == "error":
             log.write(f"[bold red]x error[/bold red] {ev.payload['message']}")
