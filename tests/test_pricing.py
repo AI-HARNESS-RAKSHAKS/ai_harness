@@ -99,3 +99,75 @@ def test_format_dollars():
     from harness.flow import _fmt_dollars
     assert _fmt_dollars(0.000123).startswith("$")
     assert _fmt_dollars(1.234) == "$1.23"
+
+
+# --- DeepSeek (the judges will use this) ---
+
+def test_deepseek_chat_pricing():
+    p = get_pricing("deepseek-chat")
+    assert p.input > 0
+    assert p.output > p.input
+    assert p.cached_input > 0
+    assert p.cached_input < p.input
+
+
+def test_deepseek_context_windows():
+    assert get_context_window("deepseek-chat") == 64_000
+    assert get_context_window("deepseek-reasoner") == 128_000
+    assert get_context_window("deepseek-flash") == 64_000
+
+
+def test_deepseek_flash_is_cheapest():
+    flash = get_pricing("deepseek-flash")
+    chat = get_pricing("deepseek-chat")
+    assert flash.input < chat.input
+    assert flash.output < chat.output
+
+
+# --- Qwen via DashScope (judges will also use this) ---
+
+def test_qwen_pricing():
+    for m in ("qwen-turbo", "qwen-plus", "qwen-max", "qwen-coder-plus"):
+        p = get_pricing(m)
+        assert p.input > 0
+        assert p.output > 0
+
+
+def test_qwen_context_windows():
+    # qwen-long has 10M context
+    assert get_context_window("qwen-long") == 10_000_000
+    assert get_context_window("qwen-turbo") == 1_000_000
+    assert get_context_window("qwen-plus") == 128_000
+
+
+def test_qwen_turbo_is_cheapest():
+    turbo = get_pricing("qwen-turbo")
+    max_ = get_pricing("qwen-max")
+    assert turbo.input < max_.input
+    assert turbo.output < max_.output
+
+
+# --- Base URLs ---
+
+def test_base_urls():
+    from harness.pricing import BASE_URLS
+    assert "deepseek" in BASE_URLS
+    assert "qwen" in BASE_URLS
+    assert BASE_URLS["deepseek"].startswith("https://")
+    assert BASE_URLS["qwen"].startswith("https://")
+
+
+# --- Cost estimate for judge models ---
+
+def test_cost_deepseek_chat_typical_run():
+    # 10k input, 1k output, 5k cached - typical 5-step coding task
+    in_c, out_c, total = estimate_cost("deepseek-chat", 10_000, 1_000, 5_000)
+    # 5k uncached @ $0.27/M = $0.00135
+    # 5k cached @ $0.07/M = $0.00035
+    # 1k output @ $1.10/M = $0.0011
+    assert total < 0.01  # Less than a cent per task
+
+
+def test_cost_qwen_turbo_typical_run():
+    in_c, out_c, total = estimate_cost("qwen-turbo", 10_000, 1_000, 5_000)
+    assert total < 0.005  # Even cheaper

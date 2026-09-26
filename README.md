@@ -19,6 +19,10 @@ make run
 | Provider | `AI_BASE_URL` | `AI_MODEL` | Notes |
 |---|---|---|---|
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | default |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` | **judges will use this** |
+| **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-flash` | cheapest, very fast |
+| **Qwen** (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-turbo` | **judges will use this** |
+| **Qwen** (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-coder-plus` | best for code |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash` | |
 | xAI Grok | `https://api.x.ai/v1` | `grok-2-latest` | |
 | Groq | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | free tier |
@@ -56,12 +60,16 @@ Built-in techniques borrowed from both projects (DeerFlow = bytedance/deer-flow,
 
 | Provider    | Cheapest capable model           | Set with              |
 |-------------|----------------------------------|-----------------------|
+| **DeepSeek** | `deepseek-flash` ($0.014/M in) | `AI_MODEL=deepseek-flash` |
+| **DeepSeek** | `deepseek-chat` (V3, smart) | `AI_MODEL=deepseek-chat` |
+| **Qwen** | `qwen-turbo` ($0.05/M in) | `AI_MODEL=qwen-turbo` |
+| **Qwen** | `qwen-coder-plus` (best for code) | `AI_MODEL=qwen-coder-plus` |
 | OpenAI      | `gpt-4.1-nano` (~33% cheaper than `gpt-4o-mini`) | `AI_MODEL=gpt-4.1-nano` |
 | OpenAI      | `gpt-4o-mini` (default)           | —                     |
 | Groq        | `llama-3.1-8b-instant` (free tier) | `AI_MODEL=llama-3.1-8b-instant` `AI_BASE_URL=https://api.groq.com/openai/v1` |
 | OpenRouter  | `meta-llama/llama-3.1-8b-instruct` | `AI_BASE_URL=https://openrouter.ai/api/v1` |
 
-Set `AI_SUBAGENT_MODEL=gpt-4.1-nano` to make sub-agents use a cheaper model than the parent.
+Set `AI_SUBAGENT_MODEL=deepseek-flash` (or `qwen-turbo`) to make sub-agents use a cheaper model than the parent.
 
 ## Standard evaluation interface
 
@@ -73,7 +81,7 @@ make setup
 make run
 ```
 
-The Makefile also exposes `make test` (108 tests) and `make clean`.
+The Makefile also exposes `make test` (126 tests) and `make clean`.
 
 ## Environment variables
 
@@ -138,7 +146,8 @@ No credentials are committed. See `.env.example`.
     ├── test_optimize.py
     ├── test_flow.py
     ├── test_llm.py
-    └── test_pricing.py
+    ├── test_pricing.py
+    └── test_providers.py   # end-to-end with DeepSeek + Qwen response shapes
 ```
 
 ## Visual data-flow panel

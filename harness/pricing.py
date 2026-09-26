@@ -50,6 +50,18 @@ PRICING: dict[str, ModelPricing] = {
     "claude-3-5-haiku":     ModelPricing(0.80, 4.00, 0.08),
     "claude-3-5-sonnet":    ModelPricing(3.00, 15.00, 0.30),
     "claude-haiku-4-5":     ModelPricing(1.00, 5.00, 0.10),
+    # DeepSeek (OpenAI-compatible at https://api.deepseek.com)
+    "deepseek-chat":        ModelPricing(0.27, 1.10, 0.07),
+    "deepseek-reasoner":    ModelPricing(0.55, 2.19, 0.14),
+    "deepseek-flash":       ModelPricing(0.014, 0.28, 0.014),
+    # Alibaba Qwen via DashScope OpenAI-compatible mode
+    "qwen-turbo":           ModelPricing(0.05, 0.20, 0.01),
+    "qwen-plus":            ModelPricing(0.40, 1.20, 0.10),
+    "qwen-max":             ModelPricing(2.40, 9.60, 0.60),
+    "qwen-max-longcontext": ModelPricing(0.50, 2.00, 0.10),
+    "qwen3-max":            ModelPricing(2.40, 9.60, 0.60),
+    "qwen-long":            ModelPricing(0.04, 0.40, 0.01),
+    "qwen-coder-plus":      ModelPricing(0.30, 1.20, 0.075),
 }
 
 DEFAULT_PRICING = ModelPricing(0.50, 1.50, 0.25)
@@ -74,8 +86,32 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "llama-3.1-8b-instant": 131_072,
     "llama-3.3-70b-versatile": 131_072,
     "claude-3-5-haiku":     200_000,
-    "claude-3-5-sonnet":    200_000,
+    "claude-3.5-sonnet":    200_000,
     "claude-haiku-4-5":     200_000,
+    # DeepSeek
+    "deepseek-chat":        64_000,
+    "deepseek-reasoner":    128_000,
+    "deepseek-flash":       64_000,
+    # Qwen (DashScope compatible mode)
+    "qwen-turbo":           1_000_000,
+    "qwen-plus":            128_000,
+    "qwen-max":             128_000,
+    "qwen-max-longcontext": 1_000_000,
+    "qwen3-max":            256_000,
+    "qwen-long":            10_000_000,
+    "qwen-coder-plus":      128_000,
+}
+
+# Convenience: provider base URLs (judges will use DeepSeek + Qwen).
+BASE_URLS: dict[str, str] = {
+    "openai":     "https://api.openai.com/v1",
+    "deepseek":   "https://api.deepseek.com/v1",
+    "qwen":       "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "google":     "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "xai":        "https://api.x.ai/v1",
+    "groq":       "https://api.groq.com/openai/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "together":   "https://api.together.xyz/v1",
 }
 
 DEFAULT_CONTEXT_WINDOW = 128_000
