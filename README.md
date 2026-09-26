@@ -8,9 +8,20 @@ The agent receives a natural-language task, uses tools (`read_file`, `write_file
 
 ```bash
 export AI_API_KEY="<your-key>"
+export AI_BASE_URL="<openai-compatible-endpoint>"
+export AI_MODEL="<model-name>"
 make setup
 make run
 ```
+
+### Example providers
+
+| Provider | `AI_BASE_URL` | `AI_MODEL` | Notes |
+|---|---|---|---|
+| OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | default |
+| Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash` | |
+| xAI Grok | `https://api.x.ai/v1` | `grok-2-latest` | |
+| Groq | `https://api.groq.com/openai/v1` | `llama-3.1-8b-instant` | free tier |
 
 ## Why this is faster & cheaper than DeerFlow / Pi
 
@@ -30,13 +41,16 @@ Built-in techniques borrowed from both projects (DeerFlow = bytedance/deer-flow,
 | Short-window call dedup (read_file / list_files) | this repo | re-reads are free |
 | Sub-agent returns trimmed + externalised if huge | this repo | keeps parent context small |
 
-### Speed optimisations
+### Speed & reliability
 
 | Technique | Source | Effect |
 |---|---|---|
-| Parallel tool execution (`asyncio.gather` over concurrent calls) | Pi | ~Nx speedup when assistant emits multiple calls |
+| **Parallel tool execution** (`asyncio.gather` over concurrent calls) | Pi | ~Nx speedup when assistant emits multiple calls |
 | Sub-agent tool (`task`) with isolated context, bounded turns, optionally cheaper model | both — Pi doesn't have it | delegate bounded subtasks |
 | Two-layer loop detection (identical-call hash + per-tool frequency) | DeerFlow | stops runaway loops |
+| **Auto-retry with exponential backoff** for 408/409/425/429/500/502/503/504 | this repo | survives transient failures (Google 503, OpenAI 429) |
+| **SSE streaming** for assistant responses | this repo | text appears token-by-token as the LLM generates |
+| Retry-After header honoured | this repo | respects provider pacing |
 
 ### Recommended model choices
 
@@ -59,7 +73,7 @@ make setup
 make run
 ```
 
-The Makefile also exposes `make test` (61 tests) and `make clean`.
+The Makefile also exposes `make test` (85 tests) and `make clean`.
 
 ## Environment variables
 
@@ -110,8 +124,9 @@ No credentials are committed. See `.env.example`.
 │   ├── __init__.py
 │   ├── __main__.py         # entry: python -m harness
 │   ├── config.py           # env loading
-│   ├── llm.py              # OpenAI-compatible client
+│   ├── llm.py              # OpenAI-compatible client + retry + streaming
 │   ├── optimize.py         # budget / loops / externalisation / dedup / truncate
+│   ├── flow.py             # FlowPanel - visual data-flow widget
 │   ├── tools.py            # tool implementations + schemas
 │   ├── agent.py            # agent loop (parallel exec, sub-agents, elision)
 │   └── app.py              # Textual TUI
@@ -119,8 +134,46 @@ No credentials are committed. See `.env.example`.
     ├── test_smoke.py
     ├── test_tools.py
     ├── test_agent.py
-    └── test_optimize.py
+    ├── test_optimize.py
+    ├── test_flow.py
+    └── test_llm.py
 ```
+
+## Visual data-flow panel
+
+While the harness runs, a live panel at the top of the TUI shows exactly where data is flowing and how much:
+
+```
+┌─ DATA FLOW PIPELINE ─────────────────────────────────────────────────────┐
+│                                                                         │
+│  USER  ── "list files in this directory" ──▶                            │
+│        28 chars in                                                      │
+│                                                                         │
+│  AGENT ── step 3/20 ──▶                                                 │
+│        in: 1,250 tok · out: 87 tok                                      │
+│        │                                                                │
+│        ▼                                                                │
+│  LLM   gemini-3.8-flash                                                 │
+│        ↳ generativelanguage.googleapis.com/v1beta/openai                │
+│        │                                                                │
+│        ▼                                                                │
+│  TOOLS ── ⚙ list_files ──▶                                             │
+│                                                                         │
+│  Σ in: 4,820 (cached 0)  Σ out: 312                                     │
+│  budget: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5,132/200,000 (2%)             │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Every `AgentEvent` updates the panel:
+- `user` → your input + char count
+- `step` → step counter + per-step token spend
+- `assistant` → model name + endpoint
+- `tool_call` → tool names being executed
+- `tool_result` → finished tools (✓)
+- `done` → final answer
+- `error` → surfaced as ✗ with message
+
+The budget bar turns yellow at 60% and red at 85%.
 
 ## Keyboard shortcuts inside the TUI
 
