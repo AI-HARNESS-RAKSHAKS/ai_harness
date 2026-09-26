@@ -244,10 +244,26 @@ def elide_superseded_writes(messages: list[dict]) -> list[dict]:
 
     superseded: set[tuple[int, int]] = set()
     for idx, (i, j, path) in enumerate(writes):
-        for later_i, _, later_path in writes[idx + 1:]:
-            if later_path and later_path == path:
-                superseded.add((i, j))
+        if not path:
+            continue
+        is_superseded = False
+        for later_msg in messages[i + 1:]:
+            if later_msg.get("role") != "assistant" or not later_msg.get("tool_calls"):
+                continue
+            for later_tc in later_msg["tool_calls"]:
+                l_fn = later_tc.get("function") or {}
+                if l_fn.get("name") in ("write_file", "edit_file"):
+                    try:
+                        l_args = json.loads(l_fn.get("arguments") or "{}")
+                        if l_args.get("path") == path:
+                            is_superseded = True
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if is_superseded:
                 break
+        if is_superseded:
+            superseded.add((i, j))
 
     if not superseded:
         return messages
@@ -279,6 +295,183 @@ def elide_superseded_writes(messages: list[dict]) -> list[dict]:
         new_messages.append({**msg, "tool_calls": new_tcs})
 
     return new_messages
+
+
+# ---------------------------------------------------------------------------
+# Superseded read elision
+# ---------------------------------------------------------------------------
+
+def elide_superseded_reads(messages: list[dict]) -> list[dict]:
+    """Replace read_file tool outputs that have been superseded by a later
+    read or edit/write of the same path with a compact placeholder.
+
+    Stale reads waste hundreds/thousands of tokens and confuse the model
+    with outdated code.
+    """
+    read_calls: dict[str, tuple[int, str]] = {}
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+            continue
+        for tc in msg["tool_calls"]:
+            fn = tc.get("function") or {}
+            if fn.get("name") != "read_file":
+                continue
+            cid = tc.get("id")
+            if not cid:
+                continue
+            args_raw = fn.get("arguments") or "{}"
+            try:
+                args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                path = args.get("path")
+                if path:
+                    read_calls[cid] = (i, str(path))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+    if not read_calls:
+        return messages
+
+    superseded_ids: set[str] = set()
+    for cid, (call_idx, path) in read_calls.items():
+        is_superseded = False
+        for later_msg in messages[call_idx + 1:]:
+            if later_msg.get("role") != "assistant" or not later_msg.get("tool_calls"):
+                continue
+            for later_tc in later_msg["tool_calls"]:
+                l_fn = later_tc.get("function") or {}
+                if l_fn.get("name") in ("read_file", "edit_file", "write_file"):
+                    l_args_raw = l_fn.get("arguments") or "{}"
+                    try:
+                        l_args = json.loads(l_args_raw) if isinstance(l_args_raw, str) else l_args_raw
+                        if l_args.get("path") == path:
+                            is_superseded = True
+                            break
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            if is_superseded:
+                break
+        if is_superseded:
+            superseded_ids.add(cid)
+
+    if not superseded_ids:
+        return messages
+
+    new_messages: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "tool" and msg.get("tool_call_id") in superseded_ids:
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > 100:
+                cid = msg.get("tool_call_id", "")
+                path = read_calls.get(cid, (0, "file"))[1]
+                new_msg = {
+                    **msg,
+                    "content": f"[stale read elided: '{path}' was modified or re-read later ({len(content)} chars saved)]",
+                }
+                new_messages.append(new_msg)
+                continue
+        new_messages.append(msg)
+
+    return new_messages
+
+
+# ---------------------------------------------------------------------------
+# Old tool result tombstoning (observation pruning)
+# ---------------------------------------------------------------------------
+
+def tombstone_old_tool_results(
+    messages: list[dict],
+    keep_recent_tools: int = 2,
+    threshold_chars: int = 250,
+) -> list[dict]:
+    """Compacts tool outputs older than `keep_recent_tools` tool executions.
+
+    The model has already observed older tool outputs. Keeping full 4000-char
+    bash outputs or file listings from early steps causes prompt tokens to grow
+    quadratically with every step.
+    Older tool outputs exceeding `threshold_chars` are replaced with a concise
+    tombstone summary.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(tool_indices) <= keep_recent_tools:
+        return messages
+
+    old_indices = set(tool_indices[:-keep_recent_tools])
+
+    new_messages: list[dict] = []
+    for i, msg in enumerate(messages):
+        if i in old_indices:
+            content = msg.get("content", "")
+            if isinstance(content, str) and len(content) > threshold_chars:
+                tool_name = msg.get("name", "tool")
+                lines = content.count("\n") + 1
+                first_line = content.splitlines()[0][:60] if content else ""
+                new_messages.append({
+                    **msg,
+                    "content": (
+                        f"[earlier {tool_name} output elided ({len(content)} chars / {lines} lines); "
+                        f"head: {first_line!r}]"
+                    ),
+                })
+                continue
+        new_messages.append(msg)
+
+    return new_messages
+
+
+# ---------------------------------------------------------------------------
+# Intermediate thought commentary stripping
+# ---------------------------------------------------------------------------
+
+def strip_intermediate_assistant_content(
+    messages: list[dict],
+    keep_recent_turns: int = 1,
+) -> list[dict]:
+    """Strip verbose intermediate thoughts/commentary from past assistant messages
+    that contain tool calls.
+
+    When an assistant outputs both text and tool_calls, the text was ephemeral
+    scratchpad thinking. Keeping 10 steps of verbose self-talk wastes tokens.
+    """
+    assistant_indices = [
+        i for i, m in enumerate(messages)
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    ]
+    if len(assistant_indices) <= keep_recent_turns:
+        return messages
+
+    old_assistant_indices = set(assistant_indices[:-keep_recent_turns])
+    new_messages: list[dict] = []
+    for i, msg in enumerate(messages):
+        if i in old_assistant_indices:
+            content = msg.get("content")
+            if content and isinstance(content, str):
+                new_messages.append({**msg, "content": ""})
+                continue
+        new_messages.append(msg)
+    return new_messages
+
+
+# ---------------------------------------------------------------------------
+# Pipeline message optimizer
+# ---------------------------------------------------------------------------
+
+def optimize_messages_for_llm(
+    messages: list[dict],
+    keep_recent_tools: int = 2,
+    threshold_chars: int = 250,
+) -> list[dict]:
+    """Pipeline that applies all context-slimming optimizations before sending
+    to the LLM API:
+    1. elide_superseded_writes (DeerFlow-style write payload elision)
+    2. elide_superseded_reads (evicts stale file read contents)
+    3. tombstone_old_tool_results (prunes older observations, cutting O(N^2) growth)
+    4. strip_intermediate_assistant_content (drops ephemeral scratchpad thoughts)
+    """
+    msgs = elide_superseded_writes(messages)
+    msgs = elide_superseded_reads(msgs)
+    msgs = tombstone_old_tool_results(msgs, keep_recent_tools=keep_recent_tools, threshold_chars=threshold_chars)
+    msgs = strip_intermediate_assistant_content(msgs)
+    return msgs
 
 
 # ---------------------------------------------------------------------------

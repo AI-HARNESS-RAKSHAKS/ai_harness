@@ -188,3 +188,60 @@ async def test_task_tool_requires_prompt(workdir):
     res = await tools.execute_tool("task", {}, agent=_StubAgent())
     assert "ERROR" in res
     assert "prompt" in res.lower()
+
+
+@pytest.mark.asyncio
+async def test_read_file_line_range(workdir):
+    content = "\n".join(f"line_{i}" for i in range(1, 21))
+    (workdir / "nums.txt").write_text(content)
+    res = await tools.read_file("nums.txt", start_line=5, end_line=8)
+    assert "[lines 5-8 of 20 in nums.txt]" in res
+    assert "   5 | line_5" in res
+    assert "   8 | line_8" in res
+    assert "line_4" not in res
+    assert "line_9" not in res
+
+
+@pytest.mark.asyncio
+async def test_read_file_outline(workdir):
+    code = """
+const db = [];
+class Store {
+    constructor() {}
+    getItem(id) {
+        return id;
+    }
+}
+function helper() {
+    return true;
+}
+"""
+    (workdir / "store.js").write_text(code)
+    res = await tools.read_file("store.js", outline=True)
+    assert "[outline of store.js:" in res
+    assert "const db =" in res
+    assert "class Store" in res
+    assert "getItem(id)" in res
+    assert "function helper()" in res
+
+
+@pytest.mark.asyncio
+async def test_search_code(workdir):
+    (workdir / "a.js").write_text("const user = 'alice';\nfunction login() {}")
+    (workdir / "b.js").write_text("const user = 'bob';")
+    res = await tools.search_code("alice")
+    assert "a.js:1:" in res
+    assert "const user = 'alice'" in res
+    assert "b.js" not in res
+
+
+def test_prune_stack_trace():
+    raw_trace = """TypeError: boom
+    at ShoppingCart.addItem (/app/ecommerce.js:25:24)
+    at Module._compile (node:internal/modules/cjs/loader:1376:14)
+    at Module._extensions..js (node:internal/modules/cjs/loader:1435:10)
+    at Module.load (node:internal/modules/cjs/loader:1207:32)"""
+    cleaned = tools.prune_stack_trace(raw_trace)
+    assert "/app/ecommerce.js:25:24" in cleaned
+    assert "node:internal" not in cleaned
+    assert "internal runtime frames omitted" in cleaned

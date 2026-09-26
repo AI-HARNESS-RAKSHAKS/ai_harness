@@ -26,6 +26,7 @@ class Config:
     subagent_model: str | None
     subagent_max_steps: int
     subagent_default_max_turns: int
+    tombstone_recent_tools: int = 2
 
 
 def load_config() -> Config:
@@ -59,4 +60,5 @@ def load_config() -> Config:
         subagent_model=os.environ.get("AI_SUBAGENT_MODEL") or None,
         subagent_max_steps=max(1, int(os.environ.get("AI_SUBAGENT_MAX_STEPS", "15"))),
         subagent_default_max_turns=max(1, int(os.environ.get("AI_SUBAGENT_DEFAULT_MAX_TURNS", "10"))),
+        tombstone_recent_tools=max(1, int(os.environ.get("AI_TOMBSTONE_RECENT_TOOLS", "2"))),
     )

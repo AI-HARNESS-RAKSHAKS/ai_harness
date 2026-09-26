@@ -12,8 +12,12 @@ from harness.optimize import (
     LoopDetector,
     TokenBudget,
     ToolOutputStore,
+    elide_superseded_reads,
     elide_superseded_writes,
     gather_tool_results,
+    optimize_messages_for_llm,
+    strip_intermediate_assistant_content,
+    tombstone_old_tool_results,
     truncate_head,
     truncate_tail,
 )
@@ -242,3 +246,107 @@ async def test_gather_converts_exceptions():
     assert results[0] == "good"
     assert "ValueError" in results[1]
     assert "nope" in results[1]
+
+
+# ---------- elide_superseded_reads ----------
+
+def test_elide_superseded_reads_marks_stale_read():
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file",
+             "arguments": '{"path": "x.py"}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "read_file",
+         "content": "line 1\n" + ("x" * 500)},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_2", "type": "function", "function": {"name": "edit_file",
+             "arguments": '{"path": "x.py", "old_string": "line 1", "new_string": "line 1 modified"}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_2", "name": "edit_file", "content": "edited x.py"},
+    ]
+    rewritten = elide_superseded_reads(messages)
+    first_tool_res = rewritten[2]["content"]
+    assert "stale read elided" in first_tool_res
+    assert "x.py" in first_tool_res
+    assert "chars saved" in first_tool_res
+    # Unchanged edit_file tool result
+    assert rewritten[4]["content"] == "edited x.py"
+
+
+def test_elide_superseded_reads_preserves_latest_read():
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "read_file",
+             "arguments": '{"path": "x.py"}'}}
+        ]},
+        {"role": "tool", "tool_call_id": "call_1", "name": "read_file",
+         "content": "line 1\n" + ("x" * 500)},
+    ]
+    rewritten = elide_superseded_reads(messages)
+    assert rewritten[2]["content"] == messages[2]["content"]
+
+
+# ---------- tombstone_old_tool_results ----------
+
+def test_tombstone_old_tool_results_prunes_older_outputs():
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": {"name": "bash"}}]},
+        {"role": "tool", "tool_call_id": "1", "name": "bash", "content": "A" * 600},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "2", "function": {"name": "bash"}}]},
+        {"role": "tool", "tool_call_id": "2", "name": "bash", "content": "B" * 600},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "3", "function": {"name": "bash"}}]},
+        {"role": "tool", "tool_call_id": "3", "name": "bash", "content": "C" * 600},
+    ]
+    # keep_recent_tools=2 means tool 1 gets tombstoned, tool 2 and 3 stay
+    rewritten = tombstone_old_tool_results(messages, keep_recent_tools=2, threshold_chars=100)
+    assert "elided" in rewritten[2]["content"]
+    assert "bash" in rewritten[2]["content"]
+    assert rewritten[4]["content"] == "B" * 600
+    assert rewritten[6]["content"] == "C" * 600
+
+
+# ---------- strip_intermediate_assistant_content ----------
+
+def test_strip_intermediate_assistant_content():
+    messages = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "I am thinking out loud about how to fix this bug for 100 characters...",
+         "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "tool_call_id": "1", "content": "res"},
+        {"role": "assistant", "content": "Now I will do the next thing...",
+         "tool_calls": [{"id": "2"}]},
+    ]
+    # keep_recent_turns=1: older assistant thought is stripped to ""
+    rewritten = strip_intermediate_assistant_content(messages, keep_recent_turns=1)
+    assert rewritten[1]["content"] == ""
+    assert rewritten[3]["content"] == "Now I will do the next thing..."
+
+
+# ---------- optimize_messages_for_llm pipeline ----------
+
+def test_optimize_messages_pipeline_applies_all():
+    messages = [
+        {"role": "user", "content": "task"},
+        # Step 1: read file (big)
+        {"role": "assistant", "content": "Let me read the file first to check it out...",
+         "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "f.js"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "const foo = 1;\n" + ("x" * 600)},
+        # Step 2: write file (big)
+        {"role": "assistant", "content": "Let me write the initial file now...",
+         "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "f.js", "content": "' + ("z" * 600) + '"}'}}]},
+        {"role": "tool", "tool_call_id": "c2", "name": "write_file", "content": "wrote bytes"},
+        # Step 3: edit file (supersedes step 1 read and step 2 write)
+        {"role": "assistant", "content": "Now editing it...",
+         "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "edit_file", "arguments": '{"path": "f.js", "old_string": "a", "new_string": "b"}'}}]},
+        {"role": "tool", "tool_call_id": "c3", "name": "edit_file", "content": "edited f.js"},
+    ]
+    optimized = optimize_messages_for_llm(messages, keep_recent_tools=1)
+    # Step 1 assistant chatter stripped
+    assert optimized[1]["content"] == ""
+    # Step 1 read was superseded by write/edit
+    assert "stale read elided" in optimized[2]["content"]
+    # Step 2 write was superseded by edit
+    assert "elided" in optimized[3]["tool_calls"][0]["function"]["arguments"]

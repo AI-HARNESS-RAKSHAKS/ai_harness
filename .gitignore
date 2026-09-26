@@ -10,3 +10,6 @@ __pycache__/
 .idea/
 .vscode/
 *.js
+*.bak
+anurag.py
+hello.py

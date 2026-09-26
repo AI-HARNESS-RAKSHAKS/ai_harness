@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from rich.markup import escape as _esc
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -224,13 +226,13 @@ class HarnessApp(App):
     async def _handle_user_input(self, text: str) -> None:
         self._busy = True
         log = self.query_one("#log", RichLog)
-        log.write(f"[bold green]>[/bold green] {text}")
+        log.write(f"[bold green]>[/bold green] {_esc(text)}")
 
         try:
             async for ev in self.agent.run(text):
                 await self._render_event(ev)
         except Exception as exc:  # pragma: no cover - defensive
-            log.write(f"[bold red]x error[/bold red] {exc}")
+            log.write(f"[bold red]x error[/bold red] {_esc(str(exc))}")
 
         ext = self.agent.externalized_count
         ext_note = f"  · externalized: {ext}" if ext else ""
@@ -261,7 +263,7 @@ class HarnessApp(App):
                 dur_s = f"{dur:.1f}s" if dur >= 1 else f"{int(dur * 1000)}ms"
                 log.write(
                     f"[bold magenta]assistant[/bold magenta] "
-                    f"[dim]({dur_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{content}"
+                    f"[dim]({dur_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{_esc(content)}"
                 )
             return
         if ev.type == "tool_call":
@@ -271,11 +273,11 @@ class HarnessApp(App):
             if name == "task":
                 log.write(
                     f"[bold yellow]⚙ task[/bold yellow] "
-                    f"[dim](subagent={args.get('subagent_type', 'general')}, "
-                    f"prompt={repr(args.get('prompt', ''))[:80]}...)[/dim]"
+                    f"[dim](subagent={_esc(args.get('subagent_type', 'general'))}, "
+                    f"prompt={_esc(repr(args.get('prompt', ''))[:80])}...)[/dim]"
                 )
             else:
-                log.write(f"[bold yellow]⚙ {name}[/bold yellow] [dim]({args_str})[/dim]")
+                log.write(f"[bold yellow]⚙ {_esc(name)}[/bold yellow] [dim]({_esc(args_str)})[/dim]")
             return
         if ev.type == "tool_result":
             output = ev.payload["output"]
@@ -284,13 +286,13 @@ class HarnessApp(App):
             label = "↳ externalized →" if externalized else f"↳ output ({sz} chars)"
             log.write(f"[dim]{label}[/dim]")
             for line in str(output).splitlines()[:40]:
-                log.write(f"    {line}")
+                log.write(f"    {_esc(line)}")
             return
         if ev.type == "done":
-            log.write(f"[bold cyan]✓ done[/bold cyan] [dim]{ev.payload.get('answer', '')}[/dim]")
+            log.write(f"[bold cyan]✓ done[/bold cyan] [dim]{_esc(ev.payload.get('answer', ''))}[/dim]")
             return
         if ev.type == "error":
-            log.write(f"[bold red]x error[/bold red] {ev.payload['message']}")
+            log.write(f"[bold red]x error[/bold red] {_esc(ev.payload['message'])}")
             return
 
     async def action_clear_log(self) -> None:

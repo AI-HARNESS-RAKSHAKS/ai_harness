@@ -8,6 +8,7 @@ to disk with a short synopsis (see ``optimize.ToolOutputStore``).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -32,10 +33,8 @@ _OUTPUT_STORE: ToolOutputStore = ToolOutputStore.default()
 
 
 def configure_limits(max_chars: int | None = None, max_lines: int | None = None) -> None:
-    if max_chars is not None:
-        _LIMITS["max_chars"] = max(64, int(max_chars))
-    if max_lines is not None:
-        _LIMITS["max_lines"] = max(2, int(max_lines))
+    _LIMITS["max_chars"] = max(64, int(max_chars)) if max_chars is not None else DEFAULT_MAX_OUTPUT_CHARS
+    _LIMITS["max_lines"] = max(2, int(max_lines)) if max_lines is not None else DEFAULT_MAX_OUTPUT_LINES
 
 
 def get_limits() -> tuple[int, int]:
@@ -72,7 +71,40 @@ def _postprocess(content: str, tool_name: str, *, tail: bool = False) -> str:
     return truncated
 
 
-async def read_file(path: str) -> str:
+def extract_outline(text: str, path: str) -> str:
+    """Extract code skeleton (classes, functions, methods, top-level constants) with line numbers."""
+    lines = text.splitlines()
+    total = len(lines)
+    matches = []
+    for idx, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith(("//", "#", "/*", "*")):
+            continue
+        is_symbol = False
+        if stripped.startswith(("class ", "def ", "async def ", "function ", "async function ")):
+            is_symbol = True
+        elif any(stripped.startswith(k) for k in ("const ", "let ", "var ")) and ("=" in stripped):
+            is_symbol = True
+        elif re.match(r"^[a-zA-Z_$][\w$]*\s*\([^)]*\)\s*\{", stripped):
+            is_symbol = True
+
+        if is_symbol:
+            snippet = stripped[:75]
+            matches.append(f"{idx:4d} | {snippet}")
+
+    if not matches:
+        return f"[no outline symbols found in {path} ({total} lines total)]"
+
+    header = f"[outline of {path}: {len(matches)} symbols across {total} lines]\n"
+    return header + "\n".join(matches)
+
+
+async def read_file(
+    path: str,
+    start_line: int | None = None,
+    end_line: int | None = None,
+    outline: bool = False,
+) -> str:
     p = _safe_path(path)
     if not p.exists():
         return f"ERROR: file not found: {path}"
@@ -82,6 +114,30 @@ async def read_file(path: str) -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as exc:
         return f"ERROR: failed to read {path}: {exc}"
+
+    if outline:
+        return _postprocess(extract_outline(text, path), "read_file", tail=False)
+
+    if start_line is not None or end_line is not None:
+        try:
+            s = max(1, int(start_line)) if start_line is not None else 1
+        except (ValueError, TypeError):
+            s = 1
+        try:
+            e = int(end_line) if end_line is not None else None
+        except (ValueError, TypeError):
+            e = None
+
+        lines = text.splitlines()
+        total = len(lines)
+        if s > total:
+            return f"(empty: start_line {s} exceeds {total} lines in {path})"
+        actual_e = min(total, e) if e is not None else total
+        selected = lines[s - 1 : actual_e]
+        numbered = [f"{s + idx:4d} | {line}" for idx, line in enumerate(selected)]
+        header = f"[lines {s}-{s + len(selected) - 1} of {total} in {path}]\n"
+        return _postprocess(header + "\n".join(numbered), "read_file", tail=False)
+
     return _postprocess(text, "read_file", tail=False)
 
 
@@ -146,6 +202,23 @@ async def list_files(path: str = ".") -> str:
     return _postprocess("\n".join(entries) if entries else "(empty directory)", "list_files", tail=False)
 
 
+def prune_stack_trace(stderr: str) -> str:
+    """Strips internal runtime frames (node:internal, site-packages) from crash dumps."""
+    if not stderr:
+        return stderr
+    lines = stderr.splitlines()
+    cleaned = []
+    omitted = 0
+    for line in lines:
+        if "node:internal/" in line or "(internal/" in line:
+            omitted += 1
+            continue
+        cleaned.append(line)
+    if omitted > 0:
+        cleaned.append(f"  ... [{omitted} internal runtime frames omitted]")
+    return "\n".join(cleaned)
+
+
 async def bash(command: str, timeout: int = 30) -> str:
     """Run a shell command. Output is tail-truncated and externalised if huge."""
     timeout = max(1, min(int(timeout), 120))
@@ -170,10 +243,63 @@ async def bash(command: str, timeout: int = 30) -> str:
     if out:
         parts.append(out.rstrip("\n"))
     if err:
-        parts.append("[stderr]\n" + err.rstrip("\n"))
+        cleaned_err = prune_stack_trace(err.rstrip("\n"))
+        parts.append("[stderr]\n" + cleaned_err)
     if not out and not err:
         parts.append("(no output)")
     return _postprocess("\n".join(parts), "bash", tail=True)
+
+
+async def search_code(query: str, path: str = ".", max_matches: int = 20) -> str:
+    """Fast regex or literal code search. Returns file:line: match snippets without reading whole files."""
+    if not query:
+        return "ERROR: search query cannot be empty"
+    target = _safe_path(path)
+    if not target.exists():
+        return f"ERROR: path not found: {path}"
+
+    try:
+        regex = re.compile(query, re.IGNORECASE)
+    except re.error:
+        regex = re.compile(re.escape(query), re.IGNORECASE)
+
+    matches: list[str] = []
+    ignore_dirs = {".git", ".venv", "node_modules", "__pycache__", ".pytest_cache", ".harness_outputs"}
+
+    def _search_file(f_path: Path) -> bool:
+        try:
+            rel = f_path.relative_to(WORKDIR)
+        except ValueError:
+            rel = f_path
+        try:
+            text = f_path.read_text(encoding="utf-8", errors="replace")
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if regex.search(line):
+                    matches.append(f"{rel}:{line_no}: {line.strip()[:80]}")
+                    if len(matches) >= max_matches:
+                        return True
+        except Exception:
+            pass
+        return False
+
+    if target.is_file():
+        _search_file(target)
+    else:
+        for root, dirs, files in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith(".")]
+            for file in sorted(files):
+                if file.startswith("."):
+                    continue
+                if _search_file(Path(root) / file):
+                    break
+            if len(matches) >= max_matches:
+                break
+
+    if not matches:
+        return f"no matches found for {query!r} in {path}"
+
+    header = f"[found {len(matches)} match{'es' if len(matches) != 1 else ''} for {query!r}]\n"
+    return _postprocess(header + "\n".join(matches), "search_code", tail=False)
 
 
 DONE_MARKER = "__DONE__:"
@@ -213,6 +339,7 @@ _TOOL_FUNCS = {
     "edit_file": edit_file,
     "list_files": list_files,
     "bash": bash,
+    "search_code": search_code,
 }
 
 # Terse schemas. The system prompt and these schemas form the static prefix
@@ -222,11 +349,32 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a file's contents.",
+            "description": "Read a file's contents, a line slice, or symbol outline.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                    "outline": {"type": "boolean"},
+                },
                 "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_code",
+            "description": "Fast regex search across files. Returns file:line matches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string"},
+                },
+                "required": ["query"],
                 "additionalProperties": False,
             },
         },
@@ -297,11 +445,7 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "function": {
             "name": "task",
-            "description": (
-                "Spawn an isolated sub-agent for a subtask. The sub-agent gets "
-                "only the prompt you provide (no parent history), bounded turns, "
-                "and an optionally cheaper model. Returns the sub-agent's final answer."
-            ),
+            "description": "Spawn an isolated sub-agent for a subtask. Returns final answer.",
             "parameters": {
                 "type": "object",
                 "properties": {

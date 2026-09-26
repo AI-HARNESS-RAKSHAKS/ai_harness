@@ -32,44 +32,28 @@ from .optimize import (
     ToolOutputStore,
     elide_superseded_writes,
     gather_tool_results,
+    optimize_messages_for_llm,
 )
 from .pricing import estimate_cost
 from .tools import DONE_MARKER, execute_tool
 
 
-SYSTEM_PROMPT = """You are AI Harness, a coding agent that operates inside a Textual TUI.
-
-You have exactly these tools available:
-- read_file(path)             read a file (output auto-truncated; huge outputs externalised)
-- write_file(path, content)   write content to a file (overwrites existing)
-- edit_file(path, old_string, new_string, replace_all=false)   in-place edit
-- list_files(path=".")        list a directory (head-truncated)
-- bash(command, timeout=30)   run a shell command (errors tail-kept)
-- task(prompt, subagent_type="general", max_turns=N)
-                                spawn an isolated sub-agent for a bounded subtask
-- done(answer)                finish and report the final answer
-
-Rules of engagement:
-1. EXPLORE FIRST. Use list_files then read_file before any edit. Never guess file contents.
-2. PREFER edit_file OVER write_file for existing files - it is safer and avoids full-file re-sends.
-3. KEEP BASH COMMANDS SMALL AND FOCUSED. No destructive operations (no rm -rf, no git push, no installs without need).
-4. DELEGATE bounded subtasks with task() instead of doing everything yourself.
-5. BE CONCISE. No narration, no "let me think about this" prose. The user sees only your tool calls + done summary.
-6. LARGE OUTPUTS: anything over a few KB is auto-externalised. The tool result tells you the path; call read_file if you need the full content.
-7. WHEN THE TASK IS COMPLETE, call done(answer) with a short summary of what you did.
-
-You will be told the budget (cumulative token cap) and the max steps in the system context. Do not exceed either."""
-
-
-SUBAGENT_SYSTEM_PROMPT = """You are a focused sub-agent spawned by a parent agent.
-
-You have the same tools as the parent (read_file, write_file, edit_file, list_files, bash, done) but NOT the `task` tool - do not spawn further sub-agents.
-
+SYSTEM_PROMPT = """You are AI Harness, an ultra-lean autonomous coding agent.
 Rules:
-- Solve the specific subtask given. Do not explore unrelated code.
-- Be efficient: minimum tool calls, minimum narration.
-- Call done(answer) with a concise result when finished.
-- If you cannot finish within your turn budget, call done with a partial answer explaining what blocked you."""
+1. EXPLORE FIRST: Use search_code or read_file(path, outline=true) before modifying code.
+2. SURGICAL EDITS: Use read_file with start_line/end_line to inspect exact lines, then edit_file.
+3. BATCH EDITS: When fixing multiple bugs, emit multiple edit_file calls in parallel in the same turn.
+4. ZERO CHAT: Never output commentary or narration before tool calls. Emit tool calls directly.
+5. Large outputs are auto-externalized; use read_file only if full content is needed.
+6. When done, call done(answer) with a concise summary."""
+
+
+SUBAGENT_SYSTEM_PROMPT = """You are a focused sub-agent spawned for a specific subtask.
+Tools: read_file, write_file, edit_file, list_files, bash, done.
+Rules:
+1. Focus strictly on the assigned subtask.
+2. Zero chat: emit tool calls directly without narration.
+3. Call done(answer) with a concise result when finished."""
 
 
 @dataclass
@@ -203,7 +187,10 @@ class Agent:
             yield ev
             self._emit(ev)
 
-            model_messages = elide_superseded_writes(self.messages)
+            model_messages = optimize_messages_for_llm(
+                self.messages,
+                keep_recent_tools=getattr(self.config, "tombstone_recent_tools", 2),
+            )
 
             # Stream the response. Fall back to non-streaming if the provider
             # doesn't support it (rare but possible).
@@ -507,7 +494,9 @@ class Agent:
             tail_size = window - tail_size
 
         tail = self.messages[-tail_size:]
-        if len(head) + len(tail) >= len(self.messages):
+        while tail and tail[0].get("role") == "tool":
+            tail = tail[1:]
+        if not tail or len(head) + len(tail) >= len(self.messages):
             return
         self.messages = head + tail
 
