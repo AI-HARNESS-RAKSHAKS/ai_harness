@@ -21,6 +21,7 @@ make run
 | OpenAI | `https://api.openai.com/v1` | `gpt-4o-mini` | default |
 | **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-chat` | **judges will use this** |
 | **DeepSeek** | `https://api.deepseek.com/v1` | `deepseek-flash` | cheapest, very fast |
+| **Groq** | `https://api.groq.com/openai/v1` | `qwen/qwen3.8-27b` | free tier, judges use this |
 | **Qwen** (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-turbo` | **judges will use this** |
 | **Qwen** (DashScope) | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-coder-plus` | best for code |
 | Google Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | `gemini-2.5-flash` | |

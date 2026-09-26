@@ -62,6 +62,12 @@ PRICING: dict[str, ModelPricing] = {
     "qwen3-max":            ModelPricing(2.40, 9.60, 0.60),
     "qwen-long":            ModelPricing(0.04, 0.40, 0.01),
     "qwen-coder-plus":      ModelPricing(0.30, 1.20, 0.075),
+    # Groq-hosted Qwen (free tier, very fast)
+    "qwen/qwen3.8-27b":     ModelPricing(0.20, 0.40, 0.20),
+    # Groq-hosted open-source models
+    "openai/gpt-oss-20b":   ModelPricing(0.10, 0.30, 0.10),
+    "openai/gpt-oss-120b":  ModelPricing(0.30, 0.90, 0.30),
+    "allam-2-7b":           ModelPricing(0.05, 0.15, 0.05),
 }
 
 DEFAULT_PRICING = ModelPricing(0.50, 1.50, 0.25)
@@ -100,6 +106,10 @@ CONTEXT_WINDOWS: dict[str, int] = {
     "qwen3-max":            256_000,
     "qwen-long":            10_000_000,
     "qwen-coder-plus":      128_000,
+    "qwen/qwen3.8-27b":     128_000,
+    "openai/gpt-oss-20b":   128_000,
+    "openai/gpt-oss-120b":  128_000,
+    "allam-2-7b":           8_192,
 }
 
 # Convenience: provider base URLs (judges will use DeepSeek + Qwen).
