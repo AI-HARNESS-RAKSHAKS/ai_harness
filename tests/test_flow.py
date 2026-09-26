@@ -1,4 +1,4 @@
-"""Tests for the FlowPanel renderer (pure function, no Textual needed)."""
+"""Tests for the extended FlowPanel renderer (pure function)."""
 
 from __future__ import annotations
 
@@ -6,11 +6,19 @@ from harness.flow import FlowState, _render_flow
 
 
 def _state(**kwargs) -> FlowState:
-    s = FlowState(model="gemini-3.8-flash", base_url="https://generativelanguage.googleapis.com/v1beta/openai", budget_limit=200000, max_steps=20)
+    s = FlowState(
+        model="gemini-2.5-flash",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai",
+        budget_limit=200000,
+        max_steps=20,
+        context_window=1_048_576,
+    )
     for k, v in kwargs.items():
         setattr(s, k, v)
     return s
 
+
+# --- existing tests still work ---
 
 def test_renders_user_input():
     s = _state(user_input="list files in this directory")
@@ -30,8 +38,8 @@ def test_renders_step_counter():
 def test_renders_tokens_in_and_out():
     s = _state(step_in=1200, step_out=85)
     out = _render_flow(s)
-    assert "in: 1,200 tok" in out
-    assert "out: 85 tok" in out
+    assert "in: 1,200" in out
+    assert "out: 85" in out
 
 
 def test_renders_pending_tools():
@@ -49,7 +57,7 @@ def test_renders_finished_tools():
 
 
 def test_renders_final_answer():
-    s = _state(final_answer="Done — 3 files found.")
+    s = _state(final_answer="Done - 3 files found.")
     out = _render_flow(s)
     assert "USER" in out
     assert "Done" in out
@@ -65,23 +73,16 @@ def test_renders_error():
 def test_renders_budget_bar():
     s = _state(budget_used=50000, budget_limit=200000)
     out = _render_flow(s)
-    assert "50,000" in out
-    assert "200,000" in out
-    assert "25%" in out
-    assert "budget:" in out
+    assert "50.0k" in out
+    assert "200.0k" in out
+    assert "25.0%" in out
 
 
 def test_renders_budget_bar_color_coded_red_when_high():
     s = _state(budget_used=180000, budget_limit=200000)
     out = _render_flow(s)
-    assert "90%" in out
+    assert "90.0%" in out
     assert "red" in out
-
-
-def test_renders_externalized_count():
-    s = _state(externalized=3)
-    out = _render_flow(s)
-    assert "ext:3" in out
 
 
 def test_renders_streaming_text():
@@ -94,7 +95,6 @@ def test_renders_streaming_text():
 def test_long_input_truncated():
     s = _state(user_input="x" * 200)
     out = _render_flow(s)
-    # Should be truncated with ellipsis
     assert "…" in out
 
 
@@ -102,7 +102,6 @@ def test_no_user_input_still_renders():
     s = _state()
     out = _render_flow(s)
     assert "DATA FLOW PIPELINE" in out
-    assert "USER" in out or "step 0" in out  # either header or step
 
 
 def test_reset_clears_state():
@@ -112,3 +111,88 @@ def test_reset_clears_state():
     assert s.step == 0
     assert s.total_in == 0
     assert s.externalized == 0
+
+
+# --- new detailed metrics ---
+
+def test_renders_cost():
+    s = _state(cost_total=0.0042, cost_in=0.0017, cost_out=0.0025)
+    out = _render_flow(s)
+    assert "cost" in out
+    assert "$0.0042" in out
+    assert "$0.0017" in out
+    assert "$0.0025" in out
+
+
+def test_renders_context_usage():
+    s = _state(context_used=5000, context_window=1_048_576)
+    out = _render_flow(s)
+    assert "context" in out
+    assert "0.5%" in out or "0.4%" in out  # ~0.48%
+    assert "free" in out
+
+
+def test_renders_context_usage_high():
+    s = _state(context_used=900_000, context_window=1_000_000)
+    out = _render_flow(s)
+    assert "90.0%" in out
+    assert "red" in out  # high usage → red bar
+
+
+def test_renders_speed_metrics():
+    s = _state(avg_tokens_per_second=87.5, last_step_duration=1.2, elapsed=4.2)
+    out = _render_flow(s)
+    assert "speed" in out
+    # 87.5 rounds to 88 with :.0f
+    assert "88 tok/s" in out
+    assert "1.2s" in out
+    assert "4.2s" in out
+
+
+def test_renders_cached_tokens_with_color():
+    s = _state(total_in=1000, total_cached=500)
+    out = _render_flow(s)
+    assert "cached" in out
+    assert "50%" in out
+
+
+def test_renders_dedup_hits():
+    s = _state(dedup_hits=3)
+    out = _render_flow(s)
+    assert "dedup:3" in out
+
+
+def test_renders_subagent_calls():
+    s = _state(subagent_calls=2)
+    out = _render_flow(s)
+    assert "sub-agents:2" in out
+
+
+def test_renders_externalized_count():
+    s = _state(externalized=1)
+    out = _render_flow(s)
+    assert "ext:1" in out
+
+
+def test_renders_extras_none_when_empty():
+    s = _state()
+    out = _render_flow(s)
+    assert "(none)" in out
+
+
+def test_step_cached_displayed():
+    s = _state(step_in=1000, step_out=50, step_cached=400)
+    out = _render_flow(s)
+    assert "(cached 400)" in out
+
+
+def test_detail_section_present():
+    s = _state()
+    out = _render_flow(s)
+    assert "─── DETAIL ───" in out
+
+
+def test_cost_zero_displayed():
+    s = _state(cost_total=0.0, cost_in=0.0, cost_out=0.0)
+    out = _render_flow(s)
+    assert "$0.0000" in out

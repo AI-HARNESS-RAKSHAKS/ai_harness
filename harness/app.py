@@ -13,6 +13,7 @@ from .config import load_config
 from .flow import FlowPanel, FlowState
 from .llm import LLMClient
 from .optimize import ToolOutputStore
+from .pricing import get_context_window
 
 
 class HarnessApp(App):
@@ -30,7 +31,7 @@ class HarnessApp(App):
     #flow {
         dock: top;
         height: auto;
-        max-height: 18;
+        max-height: 26;
         background: #0d1117;
         color: #c9d1d9;
         border: round #30363d;
@@ -58,6 +59,7 @@ class HarnessApp(App):
         Binding("ctrl+l", "clear_log", "Clear"),
         Binding("ctrl+r", "reset", "Reset"),
         Binding("ctrl+k", "compact", "Compact"),
+        Binding("ctrl+d", "toggle_flow", "Hide/Show flow"),
     ]
 
     TITLE = "AI Harness"
@@ -72,15 +74,18 @@ class HarnessApp(App):
         tools.configure_output_store(
             ToolOutputStore.default(threshold=self.config.externalize_threshold)
         )
+        ctx_window = get_context_window(self.config.model)
         self.flow_state = FlowState(
             model=self.config.model,
             base_url=self.config.base_url,
             budget_limit=self.config.token_budget,
             max_steps=self.config.max_steps,
+            context_window=ctx_window,
         )
         self.client = LLMClient(self.config)
         self.agent = Agent(self.config, self.client, observer=self._observe)
         self._busy = False
+        self._flow_visible = True
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
@@ -88,7 +93,7 @@ class HarnessApp(App):
         with Vertical():
             yield RichLog(id="log", wrap=True, highlight=True, markup=True, max_lines=5000)
         yield Input(
-            placeholder="Describe a task... (Enter submit · Ctrl+K compact · Ctrl+C quit)",
+            placeholder="Describe a task... (Enter submit · Ctrl+D hide flow · Ctrl+C quit)",
             id="input",
         )
         yield Footer()
@@ -97,9 +102,11 @@ class HarnessApp(App):
         u = self.agent.usage
         b = self.agent.budget
         pct = int(b.fraction * 100)
+        cost = getattr(self.agent, "_cost_total", 0.0)
         return (
             f"model: {self.config.model}   "
             f"tokens: in {u.input_tokens} (cached {u.cached_input_tokens}) | out {u.output_tokens}   "
+            f"cost: ${cost:.4f}   "
             f"budget: {b.used}/{b.limit} ({pct}%)   "
             f"state: {state}"
         )
@@ -108,18 +115,13 @@ class HarnessApp(App):
         log = self.query_one("#log", RichLog)
         log.write("[bold cyan]AI Harness[/bold cyan] [dim]- text-only coding agent[/dim]")
         log.write(f"[dim]Model: {self.config.model}   Base: {self.config.base_url}[/dim]")
+        ctx = get_context_window(self.config.model)
+        log.write(f"[dim]Context window: {ctx:,} tok · Budget: {self.config.token_budget:,} tok · "
+                  f"Sub-agent: {self.config.subagent_model or '(inherit)'} · Parallel: {self.config.parallel_tools}[/dim]")
         log.write(
-            f"[dim]Budget {self.config.token_budget} tok · externalize >={self.config.externalize_threshold} chars · "
-            f"max {self.config.max_output_tokens} out · history <={self.config.history_window} msgs[/dim]"
+            f"[dim]Auto-retry: 408/409/425/429/500/502/503/504 with exp backoff (5 attempts, honours Retry-After).[/dim]"
         )
-        log.write(
-            f"[dim]Sub-agent model: {self.config.subagent_model or '(inherit)'} · "
-            f"parallel tools: {self.config.parallel_tools}[/dim]"
-        )
-        log.write(
-            "[dim]Auto-retry: 429/503 with exp backoff (5 attempts, max 30s delay).[/dim]"
-        )
-        log.write("[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact history · Ctrl+C quit[/dim]\n")
+        log.write("[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact · Ctrl+D hide flow · Ctrl+C quit[/dim]\n")
 
     # --- FlowPanel observer (runs synchronously, never raises) ---------------
 
@@ -132,6 +134,7 @@ class HarnessApp(App):
             s.error = ""
             s.step_in = 0
             s.step_out = 0
+            s.step_cached = 0
             s.pending_tools = []
             s.finished_tools = []
             s.streaming_text = ""
@@ -140,13 +143,22 @@ class HarnessApp(App):
             s.max_steps = ev.payload.get("max", s.max_steps)
             s.step_in = 0
             s.step_out = 0
+            s.step_cached = 0
             s.pending_tools = []
             s.finished_tools = []
             s.streaming_text = ""
+            s.last_step_duration = 0.0
         elif ev.type == "assistant":
             s.last_assistant = ev.payload.get("content", "")[:200]
             s.step_in = ev.payload.get("step_in", s.step_in)
             s.step_out = ev.payload.get("step_out", s.step_out)
+            s.step_cached = ev.payload.get("step_cached", s.step_cached)
+            s.last_step_duration = ev.payload.get("step_duration", s.last_step_duration)
+            s.avg_tokens_per_second = ev.payload.get("avg_tokens_per_second", s.avg_tokens_per_second)
+            s.elapsed = ev.payload.get("elapsed", s.elapsed)
+            s.cost_in = ev.payload.get("cost_in", s.cost_in)
+            s.cost_out = ev.payload.get("cost_out", s.cost_out)
+            s.cost_total = ev.payload.get("cost_total", s.cost_total)
         elif ev.type == "tool_call":
             name = ev.payload.get("name", "")
             s.pending_tools.append(name)
@@ -154,21 +166,26 @@ class HarnessApp(App):
             if s.pending_tools:
                 s.finished_tools = s.pending_tools
                 s.pending_tools = []
-            sz = ev.payload.get("size", 0)
-            # Annotate finished tools with their result size in the log
         elif ev.type == "done":
             s.final_answer = ev.payload.get("answer", "")
             s.pending_tools = []
         elif ev.type == "error":
             s.error = ev.payload.get("message", "error")
-        # Update total counters
+
+        # Pull aggregate counters from the agent
         s.total_in = self.agent.usage.input_tokens
         s.total_out = self.agent.usage.output_tokens
         s.total_cached = self.agent.usage.cached_input_tokens
+        s.total_calls = self.agent.usage.calls
         s.budget_used = self.agent.budget.used
         s.budget_limit = self.agent.budget.limit
         s.externalized = self.agent.externalized_count
-        # Refresh the panel
+        s.dedup_hits = self.agent.dedup_hits
+        s.subagent_calls = self.agent.subagent_calls
+        # context_used = last observed prompt_tokens (most accurate we have)
+        if self.agent.usage.input_tokens > 0:
+            s.context_used = self.agent.usage.input_tokens
+
         try:
             self.query_one("#flow", FlowPanel).refresh()
         except Exception:
@@ -196,7 +213,10 @@ class HarnessApp(App):
 
         ext = self.agent.externalized_count
         ext_note = f"  · externalized: {ext}" if ext else ""
-        log.write(f"[dim]↳ {self.agent.usage.summary()}{ext_note}[/dim]\n")
+        cost = getattr(self.agent, "_cost_total", 0.0)
+        log.write(
+            f"[dim]↳ {self.agent.usage.summary()} · ${cost:.4f}{ext_note}[/dim]\n"
+        )
         self._busy = False
         self.query_one("#status", Static).update(self._status_text("ready"))
 
@@ -213,7 +233,15 @@ class HarnessApp(App):
         if ev.type == "assistant":
             content = ev.payload["content"].strip()
             if content:
-                log.write(f"[bold magenta]assistant[/bold magenta]\n{content}")
+                dur = ev.payload.get("step_duration", 0.0)
+                tok = ev.payload.get("step_out", 0)
+                tps = ev.payload.get("tokens_per_second", 0.0)
+                cost = ev.payload.get("step_cost", 0.0)
+                dur_s = f"{dur:.1f}s" if dur >= 1 else f"{int(dur * 1000)}ms"
+                log.write(
+                    f"[bold magenta]assistant[/bold magenta] "
+                    f"[dim]({dur_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{content}"
+                )
             return
         if ev.type == "tool_call":
             name = ev.payload["name"]
@@ -254,9 +282,10 @@ class HarnessApp(App):
         self.flow_state.base_url = self.config.base_url
         self.flow_state.budget_limit = self.config.token_budget
         self.flow_state.max_steps = self.config.max_steps
+        self.flow_state.context_window = get_context_window(self.config.model)
         log = self.query_one("#log", RichLog)
         log.clear()
-        log.write("[dim]Conversation reset (usage + budget + dedup cleared).[/dim]")
+        log.write("[dim]Conversation reset (usage + budget + dedup + cost cleared).[/dim]")
         self.query_one("#status", Static).update(self._status_text("ready"))
         self.query_one("#flow", FlowPanel).refresh()
 
@@ -266,6 +295,13 @@ class HarnessApp(App):
         after = len(self.agent.messages)
         log = self.query_one("#log", RichLog)
         log.write(f"[dim]compacted history: {before} → {after} messages[/dim]")
+
+    async def action_toggle_flow(self) -> None:
+        self._flow_visible = not self._flow_visible
+        try:
+            self.query_one("#flow", FlowPanel).display = self._flow_visible
+        except Exception:
+            pass
 
     async def on_unmount(self) -> None:
         await self.client.aclose()

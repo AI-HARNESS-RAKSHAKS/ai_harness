@@ -7,7 +7,7 @@ Optimised for low token/cost:
 - Token-budget hard-stop (strips tool_calls at the cap).
 - Two-layer loop detection.
 - Sub-agent spawning via the ``task`` tool with isolated context.
-- Optional streaming for assistant text (UX).
+- Per-step timing + cost accumulation for the FlowPanel.
 
 A ``FlowObserver`` callback can be attached to receive lightweight updates
 for visualisation (UI panels, logs, etc.) without coupling the agent to
@@ -17,6 +17,7 @@ any particular UI.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable
 
@@ -30,6 +31,7 @@ from .optimize import (
     elide_superseded_writes,
     gather_tool_results,
 )
+from .pricing import estimate_cost
 from .tools import DONE_MARKER, execute_tool
 
 
@@ -47,7 +49,7 @@ You have exactly these tools available:
 
 Rules of engagement:
 1. EXPLORE FIRST. Use list_files then read_file before any edit. Never guess file contents.
-2. PREFER edit_file OVER write_file for existing files — it is safer and avoids full-file re-sends.
+2. PREFER edit_file OVER write_file for existing files - it is safer and avoids full-file re-sends.
 3. KEEP BASH COMMANDS SMALL AND FOCUSED. No destructive operations (no rm -rf, no git push, no installs without need).
 4. DELEGATE bounded subtasks with task() instead of doing everything yourself.
 5. BE CONCISE. No narration, no "let me think about this" prose. The user sees only your tool calls + done summary.
@@ -124,13 +126,20 @@ class Agent:
         self.output_store = ToolOutputStore.default(threshold=config.externalize_threshold)
         self.dedup = CallDedup()
         self.externalized_count = 0
+        self.dedup_hits = 0
+        self.subagent_calls = 0
+
+        # Timing
+        self.turn_started: float = 0.0
+        self.last_step_duration: float = 0.0
+        self.step_token_rates: list[float] = []  # tok/s per step
 
     def _emit(self, ev: AgentEvent) -> None:
         if self.observer is not None:
             try:
                 self.observer(ev)
             except Exception:
-                pass  # observer errors must not break the agent
+                pass
 
     def reset(self) -> None:
         self.messages = []
@@ -139,9 +148,17 @@ class Agent:
         self.loop_detector.reset()
         self.dedup.clear()
         self.externalized_count = 0
+        self.dedup_hits = 0
+        self.subagent_calls = 0
+        self.turn_started = 0.0
+        self.last_step_duration = 0.0
+        self.step_token_rates = []
 
     async def run(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """Drive the agent loop for a single user turn."""
+        self.turn_started = time.monotonic()
+        self.step_token_rates = []
+
         self.messages.append({"role": "user", "content": user_input})
         ev = AgentEvent("user", {"content": user_input})
         yield ev
@@ -158,11 +175,12 @@ class Agent:
                 return
 
             self._compact_history()
+            step_start = time.monotonic()
+
             ev = AgentEvent("step", {"n": step + 1, "max": self.config.max_steps})
             yield ev
             self._emit(ev)
 
-            # Apply elision on a copy of messages - keep state intact.
             model_messages = elide_superseded_writes(self.messages)
 
             try:
@@ -173,8 +191,37 @@ class Agent:
                 self._emit(ev)
                 return
 
+            step_duration = time.monotonic() - step_start
+            self.last_step_duration = step_duration
+
             self.usage.add(completion.usage)
             self.budget.add(int(completion.usage.get("total_tokens") or 0))
+
+            step_in = int(completion.usage.get("prompt_tokens") or 0)
+            step_out = int(completion.usage.get("completion_tokens") or 0)
+            step_cached = int((completion.usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+
+            # Compute cost for this step
+            step_cost_in, step_cost_out, step_cost_total = estimate_cost(
+                self.config.model, step_in, step_out, step_cached
+            )
+            # Accumulate cost in usage via a sidecar dict
+            if not hasattr(self, "_cost_in"):
+                self._cost_in = 0.0
+                self._cost_out = 0.0
+                self._cost_total = 0.0
+            self._cost_in += step_cost_in
+            self._cost_out += step_cost_out
+            self._cost_total += step_cost_total
+
+            # Tokens per second for this step
+            tps = step_out / step_duration if step_duration > 0 else 0.0
+            self.step_token_rates.append(tps)
+            avg_tps = (
+                sum(self.step_token_rates) / len(self.step_token_rates)
+                if self.step_token_rates
+                else 0.0
+            )
 
             msg = completion.message
             content = (msg.get("content") or "").strip()
@@ -185,10 +232,28 @@ class Agent:
                 history_msg["tool_calls"] = tool_calls
             self.messages.append(history_msg)
 
+            ev = AgentEvent(
+                "assistant",
+                {
+                    "content": content,
+                    "step_in": step_in,
+                    "step_out": step_out,
+                    "step_cached": step_cached,
+                    "step_duration": step_duration,
+                    "tokens_per_second": tps,
+                    "avg_tokens_per_second": avg_tps,
+                    "elapsed": time.monotonic() - self.turn_started,
+                    "step_cost": step_cost_total,
+                    "cost_in": self._cost_in,
+                    "cost_out": self._cost_out,
+                    "cost_total": self._cost_total,
+                },
+            )
+            yield ev
+            self._emit(ev)
+
             if content:
-                ev = AgentEvent("assistant", {"content": content, "step_in": completion.usage.get("prompt_tokens", 0), "step_out": completion.usage.get("completion_tokens", 0)})
-                yield ev
-                self._emit(ev)
+                pass  # content rendered via event above
 
             if not tool_calls:
                 ev = AgentEvent("done", {"answer": msg.get("content") or ""})
@@ -208,7 +273,6 @@ class Agent:
                     args = {}
                 parsed_calls.append((tc, name, args))
 
-            # Emit tool_call events first so the UI sees the plan before execution.
             for tc, name, args in parsed_calls:
                 ev = AgentEvent(
                     "tool_call",
@@ -284,6 +348,7 @@ class Agent:
         if name in ("read_file", "list_files"):
             cached = self.dedup.get(name, args)
             if cached is not None:
+                self.dedup_hits += 1
                 return cached
 
         result = await execute_tool(name, args, agent=self)
@@ -316,6 +381,8 @@ class Agent:
 
         child_client = LLMClient(child_config)
         child = Agent(child_config, child_client)
+
+        self.subagent_calls += 1
 
         answer = ""
         try:
