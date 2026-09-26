@@ -45,20 +45,20 @@ def test_config_loads_defaults(monkeypatch):
     assert cfg.api_key == "test-key"
     assert cfg.base_url == "https://api.openai.com/v1"
     assert cfg.model == "gpt-4o-mini"
-    assert cfg.max_steps == 20
-    assert cfg.max_output_tokens == 2048
-    assert cfg.history_window == 40
-    assert cfg.max_tool_output_chars == 4000
-    assert cfg.max_tool_output_lines == 200
-    assert cfg.externalize_threshold == 8000
-    assert cfg.token_budget == 200000
-    assert cfg.loop_window == 20
-    assert cfg.loop_identical_threshold == 5
-    assert cfg.loop_tool_freq_threshold == 50
+    assert cfg.max_steps == 15
+    assert cfg.max_output_tokens == 1024
+    assert cfg.history_window == 30
+    assert cfg.max_tool_output_chars == 2500
+    assert cfg.max_tool_output_lines == 120
+    assert cfg.externalize_threshold == 3000
+    assert cfg.token_budget == 80000
+    assert cfg.loop_window == 15
+    assert cfg.loop_identical_threshold == 4
+    assert cfg.loop_tool_freq_threshold == 30
     assert cfg.parallel_tools is True
     assert cfg.subagent_model is None
-    assert cfg.subagent_max_steps == 15
-    assert cfg.subagent_default_max_turns == 10
+    assert cfg.subagent_max_steps == 10
+    assert cfg.subagent_default_max_turns == 8
 
 
 def test_config_overrides(monkeypatch):

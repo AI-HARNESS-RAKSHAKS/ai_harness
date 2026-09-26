@@ -60,13 +60,16 @@ class LLMClient:
 
     def __init__(self, config: Config):
         self.config = config
+        # Tighter timeouts so hung providers fail fast (the agent retries).
         self._client = httpx.AsyncClient(
             base_url=config.base_url,
             headers={
                 "Authorization": f"Bearer {config.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=httpx.Timeout(180.0, connect=10.0, read=60.0),
+            timeout=httpx.Timeout(60.0, connect=5.0, read=30.0),
+            # Keep connections alive between requests (HTTP keep-alive).
+            http2=False,
         )
 
     async def aclose(self) -> None:

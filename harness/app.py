@@ -7,7 +7,8 @@ Layout:
   │  │                                            │ │ panel  ││
   │  │  user input + tool calls + final answer    │ │ (right ││
   │  │                                            │ │ side)  ││
-  │  │                                            │ │        ││
+  │  ├────────────────────────────────────────────┤ │        ││
+  │  │  live indicator (thinking / streaming)     │ │        ││
   │  └────────────────────────────────────────────┘ └────────┘│
   │                                                              │
   ├── input box (bottom) ────────────────────────────────────────┤
@@ -33,6 +34,17 @@ from .optimize import ToolOutputStore
 from .pricing import get_context_window
 
 
+# Spinner frames for the inline indicator.
+_SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+_BAR_FRAMES = ["▎", "▌", "▊", "█"]
+_GEAR_FRAMES = ["⚙", "⊙", "⊙", "⚙"]
+
+
+def _spinner(frames: list[str], elapsed: float) -> str:
+    idx = int(elapsed * 6) % len(frames)
+    return frames[idx]
+
+
 class HarnessApp(App):
     CSS = """
     Screen {
@@ -54,6 +66,14 @@ class HarnessApp(App):
         color: #c9d1d9;
         border: round #30363d;
         padding: 1 2;
+    }
+    #live_indicator {
+        dock: bottom;
+        height: 1;
+        background: #0d1117;
+        color: #8b949e;
+        padding: 0 2;
+        border: round #21262d;
     }
     #flow {
         dock: right;
@@ -111,7 +131,9 @@ class HarnessApp(App):
         self._flow_visible = True
         self._sidebar_docked = "right"
         self._turn_started = 0.0
+        self._last_indicator_text = ""
         self._warmup_done = False
+        self._warmup_start = 0.0
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
@@ -120,6 +142,7 @@ class HarnessApp(App):
                 yield RichLog(
                     id="log", wrap=True, highlight=True, markup=True, max_lines=5000
                 )
+                yield Static("", id="live_indicator")
             yield FlowPanel(self.flow_state)
         yield Input(
             placeholder="Describe a task... (Enter submit · Ctrl+D hide flow · Ctrl+C quit)",
@@ -133,12 +156,13 @@ class HarnessApp(App):
         pct = int(b.fraction * 100)
         cost = getattr(self.agent, "_cost_total", 0.0)
         mode = "stream" if self.agent.streaming else "batch"
+        warm = "warm" if self._warmup_done else ("warming..." if self._busy is False and self._warmup_start else "")
         return (
             f"model: {self.config.model}   "
             f"in {u.input_tokens} (cached {u.cached_input_tokens}) | out {u.output_tokens}   "
             f"cost ${cost:.4f}   "
             f"budget {b.used}/{b.limit} ({pct}%)   "
-            f"mode {mode}   "
+            f"{warm}{mode}   "
             f"{state}"
         )
 
@@ -163,37 +187,92 @@ class HarnessApp(App):
             "Ctrl+D hide flow · Ctrl+B dock bottom · Ctrl+C quit[/dim]\n"
         )
 
-        # Live elapsed-time ticker - refreshes the FlowPanel every 100ms
-        # while a turn is running, so the spinner / stage label animate
+        # Live elapsed-time ticker - refreshes the inline indicator every 100ms
+        # while a turn is running, so the spinner / timer animate smoothly
         # even when nothing else changes.
         self._tick = self.set_interval(0.1, self._tick_elapsed)
 
-        # Pre-warm the HTTP connection in the background so the first
-        # real request doesn't pay the DNS / TLS / auth handshake cost.
+        # Pre-warm the HTTP connection in the background. This actually
+        # establishes TLS / DNS / connection-pool state so the first real
+        # request doesn't pay the cold-start cost.
+        self._warmup_start = time.monotonic()
         self._warmup_task = asyncio.create_task(self._warmup())
 
     async def _warmup(self) -> None:
-        """Open the connection lazily. Doesn't send any tokens."""
+        """Make a tiny GET /models request to warm the HTTP connection.
+
+        The /models endpoint is cheap (returns a JSON list, no token usage).
+        This establishes TLS, DNS, and the connection pool so the first real
+        user request starts with a warm connection.
+        """
         try:
-            # httpx will lazy-connect on first request; nothing to do here
-            # except ensure the AsyncClient is alive. We don't ping the API
-            # because that would consume tokens.
-            _ = self.client._client
+            self.query_one("#status", Static).update(
+                self._status_text("warming...")
+            )
+            await self.client._client.get("/models", timeout=10.0)
         except Exception:
+            # Warmup is best-effort; failures here are not fatal.
             pass
+        finally:
+            self._warmup_done = True
+            self._warmup_start = 0.0
+            try:
+                self.query_one("#status", Static).update(self._status_text("ready"))
+            except Exception:
+                pass
 
     def _tick_elapsed(self) -> None:
-        """Refresh the FlowPanel every 100ms during a turn so the spinner
-        animates and the elapsed counter advances even between LLM events.
+        """Refresh the inline indicator + FlowPanel every 100ms during a turn
+        so the spinner animates and the elapsed counter advances even
+        between LLM events.
         """
-        if not self._busy or self._turn_started == 0.0:
-            return
-        self.flow_state.elapsed = time.monotonic() - self._turn_started
-        # If streaming, also estimate streaming elapsed for the live TTFT view
+        if self._busy and self._turn_started > 0:
+            self.flow_state.elapsed = time.monotonic() - self._turn_started
+            self._render_inline_indicator()
         try:
             self.query_one("#flow", FlowPanel).refresh()
         except Exception:
             pass
+
+    def _render_inline_indicator(self) -> None:
+        """Update the single-line indicator below the log."""
+        s = self.flow_state
+        elapsed = s.elapsed
+
+        if s.stage in ("thinking", "connecting"):
+            spinner = _spinner(_SPINNER_FRAMES, elapsed)
+            text = f"[bold yellow]{spinner} thinking {elapsed:.1f}s[/bold yellow]"
+        elif s.stage == "streaming":
+            bar = _spinner(_BAR_FRAMES, elapsed)
+            ttft = s.last_ttft
+            tps = s.avg_tokens_per_second
+            extras = ""
+            if ttft > 0:
+                extras += f"  ttft [bold]{ttft * 1000:.0f}ms[/bold]"
+            if tps > 0:
+                extras += f"  {tps:.0f} tok/s"
+            text = f"[bold green]{bar} streaming {elapsed:.1f}s[/bold green]{extras}"
+        elif s.stage == "tools":
+            spinner = _spinner(_GEAR_FRAMES, elapsed)
+            tools_str = ", ".join(s.pending_tools[:3])
+            if not tools_str:
+                tools_str = ", ".join(s.finished_tools[:3]) or "tool"
+            text = f"[bold cyan]{spinner} executing {elapsed:.1f}s[/bold cyan]  [dim]⚙ {tools_str}[/dim]"
+        elif s.stage == "finalizing":
+            text = f"[bold blue]▣ finalizing {elapsed:.1f}s[/bold blue]"
+        elif s.stage == "done":
+            text = f"[bold green]✓ done in {elapsed:.1f}s[/bold green]  [dim]{s.total_out} tokens[/dim]"
+        elif s.stage == "error":
+            text = f"[bold red]✗ error after {elapsed:.1f}s[/bold red]"
+        else:
+            text = ""
+
+        if text != self._last_indicator_text:
+            self._last_indicator_text = text
+            try:
+                self.query_one("#live_indicator", Static).update(text)
+            except Exception:
+                pass
 
     # --- FlowPanel observer (runs synchronously, never raises) ---------------
 
@@ -287,6 +366,8 @@ class HarnessApp(App):
         if self.agent.usage.input_tokens > 0:
             s.context_used = self.agent.usage.input_tokens
 
+        # Always update the inline indicator on every event.
+        self._render_inline_indicator()
         try:
             self.query_one("#flow", FlowPanel).refresh()
         except Exception:
@@ -320,12 +401,17 @@ class HarnessApp(App):
         log.write(
             f"[dim]↳ {self.agent.usage.summary()} · ${cost:.4f} · {dur:.1f}s{ext_note}[/dim]\n"
         )
+        # Hold the final indicator visible for a moment so the user sees it.
+        self.flow_state.stage = "done"
+        self._render_inline_indicator()
+        await asyncio.sleep(1.5)
         self._busy = False
         self._turn_started = 0.0
         self.query_one("#status", Static).update(self._status_text("ready"))
-        self.flow_state.stage = "done"
+        # Clear the inline indicator for the next turn.
         try:
-            self.query_one("#flow", FlowPanel).refresh()
+            self.query_one("#live_indicator", Static).update("")
+            self._last_indicator_text = ""
         except Exception:
             pass
 
@@ -398,6 +484,11 @@ class HarnessApp(App):
         log.clear()
         log.write("[dim]Conversation reset (usage + budget + dedup + cost cleared).[/dim]")
         self.query_one("#status", Static).update(self._status_text("ready"))
+        try:
+            self.query_one("#live_indicator", Static).update("")
+            self._last_indicator_text = ""
+        except Exception:
+            pass
         self.query_one("#flow", FlowPanel).refresh()
 
     async def action_compact(self) -> None:
@@ -420,7 +511,6 @@ class HarnessApp(App):
             flow = self.query_one("#flow", FlowPanel)
         except Exception:
             return
-        # Remove existing style and apply new dock
         flow.set_class(False, "docked-right", "docked-bottom")
         if self._sidebar_docked == "right":
             self._sidebar_docked = "bottom"
