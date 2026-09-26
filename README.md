@@ -73,7 +73,7 @@ make setup
 make run
 ```
 
-The Makefile also exposes `make test` (85 tests) and `make clean`.
+The Makefile also exposes `make test` (108 tests) and `make clean`.
 
 ## Environment variables
 
@@ -127,6 +127,7 @@ No credentials are committed. See `.env.example`.
 │   ├── llm.py              # OpenAI-compatible client + retry + streaming
 │   ├── optimize.py         # budget / loops / externalisation / dedup / truncate
 │   ├── flow.py             # FlowPanel - visual data-flow widget
+│   ├── pricing.py          # per-model pricing + context windows
 │   ├── tools.py            # tool implementations + schemas
 │   ├── agent.py            # agent loop (parallel exec, sub-agents, elision)
 │   └── app.py              # Textual TUI
@@ -136,49 +137,73 @@ No credentials are committed. See `.env.example`.
     ├── test_agent.py
     ├── test_optimize.py
     ├── test_flow.py
-    └── test_llm.py
+    ├── test_llm.py
+    └── test_pricing.py
 ```
 
 ## Visual data-flow panel
 
-While the harness runs, a live panel at the top of the TUI shows exactly where data is flowing and how much:
+While the harness runs, a live panel at the top of the TUI shows exactly where data is flowing, how much, and the cost:
 
 ```
 ┌─ DATA FLOW PIPELINE ─────────────────────────────────────────────────────┐
 │                                                                         │
-│  USER  ── "list files in this directory" ──▶                            │
-│        28 chars in                                                      │
+│  USER  ── "find the bug in a.js" ──▶                                    │
+│        20 chars in                                                      │
 │                                                                         │
-│  AGENT ── step 3/20 ──▶                                                 │
-│        in: 1,250 tok · out: 87 tok                                      │
+│  AGENT ── step 4/20 ──▶                                                 │
+│        in: 1,850 (cached 1,200) tok · out: 142 tok · 1.8s              │
 │        │                                                                │
 │        ▼                                                                │
-│  LLM   gemini-3.8-flash                                                 │
+│  LLM   gemini-2.5-flash                                                 │
 │        ↳ generativelanguage.googleapis.com/v1beta/openai                │
 │        │                                                                │
 │        ▼                                                                │
-│  TOOLS ── ⚙ list_files ──▶                                             │
+│  TOOLS ── ⚙ read_file, bash ──▶                                        │
 │                                                                         │
-│  Σ in: 4,820 (cached 0)  Σ out: 312                                     │
-│  budget: ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░ 5,132/200,000 (2%)             │
+│  ─── DETAIL ───                                                          │
+│  tokens   Σ in: 8.9k (cached: 5.2k = 58%) | Σ out: 612 | calls: 4      │
+│  cost     total: $0.0006  (in $0.0004 + out $0.0002)                    │
+│  context  ~1.9k / 1.05M (0.2%)  ░░░░░░░░░░░░░░░░░░░░░░░░ (1.05M free)  │
+│  budget   9.5k / 200.0k (4.8%)  █░░░░░░░░░░░░░░░░░░░░░░░               │
+│  speed    avg: 78 tok/s · last step: 1.8s · elapsed: 7.4s               │
+│  extras   ext:1 · dedup:2 · sub-agents:1                               │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+**What the detail section shows:**
+
+| Field | Meaning |
+|---|---|
+| `tokens` | Total input/output across all calls. Cache % turns **green** when >30%, yellow at 5–30%, dim otherwise |
+| `cost` | USD estimate based on per-model pricing (see `harness/pricing.py`). Cached input shown separately |
+| `context` | Estimated prompt size vs the model's context window. Bar turns red at 85% |
+| `budget` | Cumulative token cap (default 200k). Bar yellow at 60%, red at 85% |
+| `speed` | Average tokens/sec, last step duration, total elapsed |
+| `extras` | Externalised outputs, dedup hits, sub-agent invocations |
 
 Every `AgentEvent` updates the panel:
 - `user` → your input + char count
 - `step` → step counter + per-step token spend
-- `assistant` → model name + endpoint
+- `assistant` → model name + endpoint + per-step timing/cost
 - `tool_call` → tool names being executed
 - `tool_result` → finished tools (✓)
 - `done` → final answer
 - `error` → surfaced as ✗ with message
 
-The budget bar turns yellow at 60% and red at 85%.
+Pricing data covers 25+ models (OpenAI, Gemini, Grok, Groq, Anthropic). Override per-session via env:
+```bash
+export AI_INPUT_PRICE=0.5     # USD per 1M input tokens
+export AI_OUTPUT_PRICE=2.0    # USD per 1M output tokens
+export AI_CACHED_PRICE=0.1    # USD per 1M cached input tokens
+export AI_CONTEXT_WINDOW=500000
+```
 
 ## Keyboard shortcuts inside the TUI
 
 - `Enter` — submit the current input
 - `Ctrl+L` — clear the log
-- `Ctrl+R` — reset the conversation, usage, and budget counters
+- `Ctrl+R` — reset the conversation, usage, budget, and cost counters
 - `Ctrl+K` — compact history (drop middle messages, keep head + tail)
+- `Ctrl+D` — hide / show the FlowPanel
 - `Ctrl+C` — quit
