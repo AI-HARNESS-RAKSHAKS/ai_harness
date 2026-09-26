@@ -7,13 +7,18 @@ Optimised for low token/cost:
 - Token-budget hard-stop (strips tool_calls at the cap).
 - Two-layer loop detection.
 - Sub-agent spawning via the ``task`` tool with isolated context.
+- Optional streaming for assistant text (UX).
+
+A ``FlowObserver`` callback can be attached to receive lightweight updates
+for visualisation (UI panels, logs, etc.) without coupling the agent to
+any particular UI.
 """
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from .config import Config
 from .llm import LLMClient
@@ -28,29 +33,36 @@ from .optimize import (
 from .tools import DONE_MARKER, execute_tool
 
 
-SYSTEM_PROMPT = """Coding agent. Use tools to act on the working directory.
+SYSTEM_PROMPT = """You are AI Harness, a coding agent that operates inside a Textual TUI.
 
-Tools:
-- read_file(path)            read a file (output truncated; huge outputs externalised)
-- write_file(path, content)  write a file (overwrites)
-- edit_file(path, old, new, replace_all=false)  in-place edit
-- list_files(path=".")       list a directory
-- bash(command, timeout=30)  run a shell command (errors are tail-kept)
+You have exactly these tools available:
+- read_file(path)             read a file (output auto-truncated; huge outputs externalised)
+- write_file(path, content)   write content to a file (overwrites existing)
+- edit_file(path, old_string, new_string, replace_all=false)   in-place edit
+- list_files(path=".")        list a directory (head-truncated)
+- bash(command, timeout=30)   run a shell command (errors tail-kept)
 - task(prompt, subagent_type="general", max_turns=N)
-                               spawn an isolated sub-agent for a subtask
-- done(answer)               finish with a short summary
+                                spawn an isolated sub-agent for a bounded subtask
+- done(answer)                finish and report the final answer
 
-Rules: explore first (list_files / read_file). Prefer edit_file over write_file. Run small bash commands. Avoid destructive ops. Be concise - no narration. Use task() to delegate bounded subtasks instead of doing everything yourself. Call done when complete.
+Rules of engagement:
+1. EXPLORE FIRST. Use list_files then read_file before any edit. Never guess file contents.
+2. PREFER edit_file OVER write_file for existing files — it is safer and avoids full-file re-sends.
+3. KEEP BASH COMMANDS SMALL AND FOCUSED. No destructive operations (no rm -rf, no git push, no installs without need).
+4. DELEGATE bounded subtasks with task() instead of doing everything yourself.
+5. BE CONCISE. No narration, no "let me think about this" prose. The user sees only your tool calls + done summary.
+6. LARGE OUTPUTS: anything over a few KB is auto-externalised. The tool result tells you the path; call read_file if you need the full content.
+7. WHEN THE TASK IS COMPLETE, call done(answer) with a short summary of what you did.
 
-Tool outputs: large outputs are externalised to a file with a synopsis. Use read_file on the returned path if you need the full content."""
+You will be told the budget (cumulative token cap) and the max steps in the system context. Do not exceed either."""
 
 
 SUBAGENT_SYSTEM_PROMPT = """You are a focused sub-agent spawned by a parent agent.
 
-You have access to the same tools as the parent (read_file, write_file, edit_file, list_files, bash, done) but NOT the `task` tool - do not spawn further sub-agents.
+You have the same tools as the parent (read_file, write_file, edit_file, list_files, bash, done) but NOT the `task` tool - do not spawn further sub-agents.
 
 Rules:
-- Solve the specific subtask given to you. Do not explore unrelated code.
+- Solve the specific subtask given. Do not explore unrelated code.
 - Be efficient: minimum tool calls, minimum narration.
 - Call done(answer) with a concise result when finished.
 - If you cannot finish within your turn budget, call done with a partial answer explaining what blocked you."""
@@ -87,10 +99,20 @@ class TokenUsage:
         )
 
 
+# Type alias: a lightweight callback for UI observers
+FlowObserver = Callable[[AgentEvent], None]
+
+
 class Agent:
-    def __init__(self, config: Config, client: LLMClient):
+    def __init__(
+        self,
+        config: Config,
+        client: LLMClient,
+        observer: FlowObserver | None = None,
+    ):
         self.config = config
         self.client = client
+        self.observer = observer
         self.messages: list[dict] = []
         self.usage = TokenUsage()
         self.budget = TokenBudget(limit=config.token_budget)
@@ -103,6 +125,13 @@ class Agent:
         self.dedup = CallDedup()
         self.externalized_count = 0
 
+    def _emit(self, ev: AgentEvent) -> None:
+        if self.observer is not None:
+            try:
+                self.observer(ev)
+            except Exception:
+                pass  # observer errors must not break the agent
+
     def reset(self) -> None:
         self.messages = []
         self.usage = TokenUsage()
@@ -114,18 +143,24 @@ class Agent:
     async def run(self, user_input: str) -> AsyncIterator[AgentEvent]:
         """Drive the agent loop for a single user turn."""
         self.messages.append({"role": "user", "content": user_input})
-        yield AgentEvent("user", {"content": user_input})
+        ev = AgentEvent("user", {"content": user_input})
+        yield ev
+        self._emit(ev)
 
         for step in range(self.config.max_steps):
             if self.budget.exceeded:
-                yield AgentEvent(
+                ev = AgentEvent(
                     "error",
                     {"message": f"token budget exhausted ({self.budget.used}/{self.budget.limit})"},
                 )
+                yield ev
+                self._emit(ev)
                 return
 
             self._compact_history()
-            yield AgentEvent("step", {"n": step + 1, "max": self.config.max_steps})
+            ev = AgentEvent("step", {"n": step + 1, "max": self.config.max_steps})
+            yield ev
+            self._emit(ev)
 
             # Apply elision on a copy of messages - keep state intact.
             model_messages = elide_superseded_writes(self.messages)
@@ -133,7 +168,9 @@ class Agent:
             try:
                 completion = await self.client.chat(model_messages, system=SYSTEM_PROMPT)
             except Exception as exc:
-                yield AgentEvent("error", {"message": f"LLM call failed: {exc}"})
+                ev = AgentEvent("error", {"message": f"LLM call failed: {exc}"})
+                yield ev
+                self._emit(ev)
                 return
 
             self.usage.add(completion.usage)
@@ -149,10 +186,14 @@ class Agent:
             self.messages.append(history_msg)
 
             if content:
-                yield AgentEvent("assistant", {"content": content})
+                ev = AgentEvent("assistant", {"content": content, "step_in": completion.usage.get("prompt_tokens", 0), "step_out": completion.usage.get("completion_tokens", 0)})
+                yield ev
+                self._emit(ev)
 
             if not tool_calls:
-                yield AgentEvent("done", {"answer": msg.get("content") or ""})
+                ev = AgentEvent("done", {"answer": msg.get("content") or ""})
+                yield ev
+                self._emit(ev)
                 return
 
             parsed_calls: list[tuple[dict, str, dict]] = []
@@ -167,16 +208,21 @@ class Agent:
                     args = {}
                 parsed_calls.append((tc, name, args))
 
+            # Emit tool_call events first so the UI sees the plan before execution.
             for tc, name, args in parsed_calls:
-                yield AgentEvent(
+                ev = AgentEvent(
                     "tool_call",
                     {"id": tc.get("id", ""), "name": name, "arguments": args},
                 )
+                yield ev
+                self._emit(ev)
 
             for tc, name, args in parsed_calls:
                 should_stop, reason = self.loop_detector.check(name, args)
                 if should_stop:
-                    yield AgentEvent("error", {"message": f"loop detected: {reason}"})
+                    ev = AgentEvent("error", {"message": f"loop detected: {reason}"})
+                    yield ev
+                    self._emit(ev)
                     return
 
             if self.config.parallel_tools and len(parsed_calls) > 1:
@@ -203,10 +249,17 @@ class Agent:
                         self.externalized_count += 1
                         display_result = new_result
 
-                yield AgentEvent(
+                ev = AgentEvent(
                     "tool_result",
-                    {"id": tc_id, "name": name, "output": display_result},
+                    {
+                        "id": tc_id,
+                        "name": name,
+                        "output": display_result,
+                        "size": len(display_result) if isinstance(display_result, str) else 0,
+                    },
                 )
+                yield ev
+                self._emit(ev)
                 self.messages.append({
                     "role": "tool",
                     "tool_call_id": tc_id,
@@ -215,16 +268,19 @@ class Agent:
                 })
 
             if done_answer is not None:
-                yield AgentEvent("done", {"answer": done_answer})
+                ev = AgentEvent("done", {"answer": done_answer})
+                yield ev
+                self._emit(ev)
                 return
 
-        yield AgentEvent(
+        ev = AgentEvent(
             "error",
             {"message": f"reached max steps ({self.config.max_steps}) without finishing."},
         )
+        yield ev
+        self._emit(ev)
 
     async def _execute_one(self, name: str, args: dict, tc_id: str) -> str:
-        """Run one tool call, applying dedup + externalisation."""
         if name in ("read_file", "list_files"):
             cached = self.dedup.get(name, args)
             if cached is not None:
@@ -244,12 +300,6 @@ class Agent:
         subagent_type: str = "general",
         max_turns: int | None = None,
     ) -> str:
-        """Spawn an isolated sub-agent for a subtask.
-
-        Returns a single string answer (truncated + externalised if huge).
-        The sub-agent has its own LLM client (optionally a cheaper model),
-        fresh context, bounded turns, and a focused system prompt.
-        """
         bound = max_turns or self.config.subagent_default_max_turns
 
         from dataclasses import replace
@@ -290,7 +340,6 @@ class Agent:
         return answer
 
     def _compact_history(self) -> None:
-        """Bound the conversation history to keep input tokens low."""
         window = self.config.history_window
         if len(self.messages) <= window:
             return

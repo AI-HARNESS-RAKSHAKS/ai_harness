@@ -8,8 +8,9 @@ from textual.containers import Vertical
 from textual.widgets import Footer, Input, RichLog, Static
 
 from . import tools
-from .agent import Agent
+from .agent import Agent, AgentEvent
 from .config import load_config
+from .flow import FlowPanel, FlowState
 from .llm import LLMClient
 from .optimize import ToolOutputStore
 
@@ -24,6 +25,15 @@ class HarnessApp(App):
         height: 1;
         background: #161b22;
         color: #8b949e;
+        padding: 0 1;
+    }
+    #flow {
+        dock: top;
+        height: auto;
+        max-height: 18;
+        background: #0d1117;
+        color: #c9d1d9;
+        border: round #30363d;
         padding: 0 1;
     }
     #log {
@@ -59,16 +69,28 @@ class HarnessApp(App):
             max_chars=self.config.max_tool_output_chars,
             max_lines=self.config.max_tool_output_lines,
         )
-        tools.configure_output_store(ToolOutputStore.default(threshold=self.config.externalize_threshold))
+        tools.configure_output_store(
+            ToolOutputStore.default(threshold=self.config.externalize_threshold)
+        )
+        self.flow_state = FlowState(
+            model=self.config.model,
+            base_url=self.config.base_url,
+            budget_limit=self.config.token_budget,
+            max_steps=self.config.max_steps,
+        )
         self.client = LLMClient(self.config)
-        self.agent = Agent(self.config, self.client)
+        self.agent = Agent(self.config, self.client, observer=self._observe)
         self._busy = False
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
+        yield FlowPanel(self.flow_state)
         with Vertical():
             yield RichLog(id="log", wrap=True, highlight=True, markup=True, max_lines=5000)
-        yield Input(placeholder="Describe a task... (Enter submit · Ctrl+K compact · Ctrl+C quit)", id="input")
+        yield Input(
+            placeholder="Describe a task... (Enter submit · Ctrl+K compact · Ctrl+C quit)",
+            id="input",
+        )
         yield Footer()
 
     def _status_text(self, state: str) -> str:
@@ -94,7 +116,63 @@ class HarnessApp(App):
             f"[dim]Sub-agent model: {self.config.subagent_model or '(inherit)'} · "
             f"parallel tools: {self.config.parallel_tools}[/dim]"
         )
+        log.write(
+            "[dim]Auto-retry: 429/503 with exp backoff (5 attempts, max 30s delay).[/dim]"
+        )
         log.write("[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact history · Ctrl+C quit[/dim]\n")
+
+    # --- FlowPanel observer (runs synchronously, never raises) ---------------
+
+    def _observe(self, ev: AgentEvent) -> None:
+        """Push AgentEvents into the FlowState and refresh the panel."""
+        s = self.flow_state
+        if ev.type == "user":
+            s.user_input = ev.payload.get("content", "")
+            s.final_answer = ""
+            s.error = ""
+            s.step_in = 0
+            s.step_out = 0
+            s.pending_tools = []
+            s.finished_tools = []
+            s.streaming_text = ""
+        elif ev.type == "step":
+            s.step = ev.payload.get("n", 0)
+            s.max_steps = ev.payload.get("max", s.max_steps)
+            s.step_in = 0
+            s.step_out = 0
+            s.pending_tools = []
+            s.finished_tools = []
+            s.streaming_text = ""
+        elif ev.type == "assistant":
+            s.last_assistant = ev.payload.get("content", "")[:200]
+            s.step_in = ev.payload.get("step_in", s.step_in)
+            s.step_out = ev.payload.get("step_out", s.step_out)
+        elif ev.type == "tool_call":
+            name = ev.payload.get("name", "")
+            s.pending_tools.append(name)
+        elif ev.type == "tool_result":
+            if s.pending_tools:
+                s.finished_tools = s.pending_tools
+                s.pending_tools = []
+            sz = ev.payload.get("size", 0)
+            # Annotate finished tools with their result size in the log
+        elif ev.type == "done":
+            s.final_answer = ev.payload.get("answer", "")
+            s.pending_tools = []
+        elif ev.type == "error":
+            s.error = ev.payload.get("message", "error")
+        # Update total counters
+        s.total_in = self.agent.usage.input_tokens
+        s.total_out = self.agent.usage.output_tokens
+        s.total_cached = self.agent.usage.cached_input_tokens
+        s.budget_used = self.agent.budget.used
+        s.budget_limit = self.agent.budget.limit
+        s.externalized = self.agent.externalized_count
+        # Refresh the panel
+        try:
+            self.query_one("#flow", FlowPanel).refresh()
+        except Exception:
+            pass
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if self._busy:
@@ -112,7 +190,7 @@ class HarnessApp(App):
 
         try:
             async for ev in self.agent.run(text):
-                await self._render(ev)
+                await self._render_event(ev)
         except Exception as exc:  # pragma: no cover - defensive
             log.write(f"[bold red]x error[/bold red] {exc}")
 
@@ -122,7 +200,7 @@ class HarnessApp(App):
         self._busy = False
         self.query_one("#status", Static).update(self._status_text("ready"))
 
-    async def _render(self, ev) -> None:
+    async def _render_event(self, ev: AgentEvent) -> None:
         log = self.query_one("#log", RichLog)
         status = self.query_one("#status", Static)
 
@@ -152,8 +230,9 @@ class HarnessApp(App):
             return
         if ev.type == "tool_result":
             output = ev.payload["output"]
+            sz = ev.payload.get("size", 0)
             externalized = isinstance(output, str) and output.startswith("[externalized:")
-            label = "↳ externalized →" if externalized else "↳ output:"
+            label = "↳ externalized →" if externalized else f"↳ output ({sz} chars)"
             log.write(f"[dim]{label}[/dim]")
             for line in str(output).splitlines()[:40]:
                 log.write(f"    {line}")
@@ -170,10 +249,16 @@ class HarnessApp(App):
 
     async def action_reset(self) -> None:
         self.agent.reset()
+        self.flow_state.reset()
+        self.flow_state.model = self.config.model
+        self.flow_state.base_url = self.config.base_url
+        self.flow_state.budget_limit = self.config.token_budget
+        self.flow_state.max_steps = self.config.max_steps
         log = self.query_one("#log", RichLog)
         log.clear()
         log.write("[dim]Conversation reset (usage + budget + dedup cleared).[/dim]")
         self.query_one("#status", Static).update(self._status_text("ready"))
+        self.query_one("#flow", FlowPanel).refresh()
 
     async def action_compact(self) -> None:
         before = len(self.agent.messages)

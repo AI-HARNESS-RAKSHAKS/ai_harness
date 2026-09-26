@@ -6,7 +6,7 @@ import pytest
 
 
 def test_modules_import():
-    from harness import agent, app, config, llm, tools, optimize  # noqa: F401
+    from harness import agent, app, config, llm, tools, optimize, flow  # noqa: F401
     assert hasattr(agent, "Agent")
     assert hasattr(agent, "TokenUsage")
     assert hasattr(app, "HarnessApp")
@@ -14,6 +14,8 @@ def test_modules_import():
     assert hasattr(llm, "LLMClient")
     assert hasattr(tools, "TOOL_SCHEMAS")
     assert hasattr(optimize, "TokenBudget")
+    assert hasattr(flow, "FlowPanel")
+    assert hasattr(flow, "FlowState")
 
 
 def test_config_requires_key(monkeypatch):
