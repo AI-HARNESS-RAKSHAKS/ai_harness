@@ -4,7 +4,10 @@ Renders the live pipeline showing:
 - Where data is going (USER -> AGENT -> LLM -> TOOLS -> ...)
 - How much data is flowing at each step (chars, tokens, call count)
 - Detailed metrics: cost, context usage, speed, dedup, sub-agents
-- The active step, model, and budget usage
+
+Designed as a narrow sidebar (default 46 cols) so the main chat log
+stays uncluttered. All truncation widths and bar lengths adapt to the
+panel width.
 """
 
 from __future__ import annotations
@@ -16,6 +19,10 @@ from typing import Any
 from textual.widgets import Static
 
 
+# Sidebar width. The FlowPanel renders content to fit this many columns.
+DEFAULT_SIDEBAR_WIDTH = 46
+
+
 @dataclass
 class FlowState:
     """Mutable state used to render the FlowPanel."""
@@ -24,6 +31,7 @@ class FlowState:
     model: str = ""
     base_url: str = ""
     context_window: int = 0
+    sidebar_width: int = DEFAULT_SIDEBAR_WIDTH
 
     # Per-turn
     user_input: str = ""
@@ -46,7 +54,7 @@ class FlowState:
     step_out: int = 0
     step_cached: int = 0
     last_step_duration: float = 0.0
-    last_ttft: float = 0.0  # time-to-first-token
+    last_ttft: float = 0.0
     avg_tokens_per_second: float = 0.0
     elapsed: float = 0.0
     is_thinking: bool = False
@@ -102,12 +110,12 @@ class FlowState:
         self.context_used = 0
 
 
-def _trunc(s: str, n: int = 36) -> str:
+def _trunc(s: str, n: int) -> str:
     s = s.replace("\n", " ").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _bar(fraction: float, length: int = 24, width: int = 80) -> tuple[str, str]:
+def _bar(fraction: float, length: int = 12) -> tuple[str, str]:
     """Render a horizontal bar. Returns (color, bar_string)."""
     pct = max(0.0, min(1.0, fraction))
     filled = int(length * pct)
@@ -131,7 +139,7 @@ def _fmt_dollars(amount: float) -> str:
         return f"${amount:.3f}"
     if amount >= 0.0001:
         return f"${amount:.4f}"
-    return f"${amount:.6f}"
+    return f"${amount:.5f}"
 
 
 def _fmt_time(seconds: float) -> str:
@@ -149,9 +157,9 @@ class FlowPanel(Static):
 
     Reads from a FlowState and re-renders itself on every change. The agent
     loop pushes updates into ``self.state`` from its event handler.
-    """
 
-    DEFAULT_CSS = ""
+    Renders compact output suitable for a 46-column sidebar.
+    """
 
     def __init__(self, state: FlowState, **kwargs: Any) -> None:
         super().__init__(id="flow", markup=True, **kwargs)
@@ -163,163 +171,157 @@ class FlowPanel(Static):
 
 def _render_flow(s: FlowState) -> str:
     """Render the FlowState as rich text. Pure function for testability."""
-    box_w = 80
-    lines: list[str] = []
+    # Sidebar layout - compact, vertical.
+    w = max(28, s.sidebar_width)            # total width including borders
+    inner = w - 2                            # content width inside │ │
+    bar_len = max(8, inner - 18)             # bar length (leave room for numbers)
+    tr = max(12, inner - 8)                  # truncation width for flowing text
 
-    lines.append(f"[bold cyan]┌─ DATA FLOW PIPELINE {'─' * (box_w - 22)}[/bold cyan]")
+    sep_top = "┌" + "─" * (w - 2) + "┐"
+    sep_bot = "└" + "─" * (w - 2) + "┘"
 
-    # USER -> AGENT
+    def row(content: str) -> str:
+        return f"[bold cyan]│[/bold cyan] {content}"
+
+    def blank() -> str:
+        return "[bold cyan]│[/bold cyan]"
+
+    lines: list[str] = [
+        f"[bold cyan]{sep_top}[/bold cyan]",
+        row("[bold]DATA FLOW[/bold]"),
+    ]
+
+    # ── Pipeline ────────────────────────────────────────────────────────
     if s.user_input:
-        lines.append("[bold cyan]│[/bold cyan]")
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [bold green]USER[/bold green]  ── \"{_trunc(s.user_input, 56)}\" ──▶"
-        )
-        lines.append(f"[bold cyan]│[/bold cyan]        [dim]{len(s.user_input)} chars in[/dim]")
+        lines.append(blank())
+        lines.append(row(
+            f"[bold green]USER[/bold green] ── \"{_trunc(s.user_input, tr - 8)}\""
+        ))
+        lines.append(row(f"[dim]  {len(s.user_input)} chars in[/dim]"))
 
-    # AGENT step
-    lines.append("[bold cyan]│[/bold cyan]")
+    lines.append(blank())
     step_label = f"step {s.step}/{s.max_steps}" if s.max_steps else f"step {s.step}"
-    in_tok = f"{s.step_in:,}" if s.step_in else "—"
-    out_tok = f"{s.step_out:,}" if s.step_out else "—"
-    cached_tok = f" (cached {s.step_cached:,})" if s.step_cached else ""
 
-    # Show thinking spinner or step info
     if s.is_thinking:
         spinner = "◐◓◑◒"[int(s.elapsed * 4) % 4] if s.elapsed else "◐"
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [bold blue]AGENT[/bold blue]  ── {step_label} "
-            f"[yellow]{spinner} thinking...[/yellow] ──▶"
-        )
-        lines.append(
-            f"[bold cyan]│[/bold cyan]        [dim]waiting for first token · "
-            f"{_fmt_time(s.elapsed)}[/dim]"
-        )
+        lines.append(row(
+            f"[bold blue]AGENT[/bold blue] {step_label} [yellow]{spinner}[/yellow]"
+        ))
+        lines.append(row(f"[dim]  thinking · {_fmt_time(s.elapsed)}[/dim]"))
     else:
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [bold blue]AGENT[/bold blue]  ── {step_label} ──▶"
-        )
+        lines.append(row(f"[bold blue]AGENT[/bold blue] {step_label}"))
+        in_tok = f"{s.step_in:,}" if s.step_in else "—"
+        out_tok = f"{s.step_out:,}" if s.step_out else "—"
+        cached_tok = f"/c{s.step_cached:,}" if s.step_cached else ""
         ttft_str = f" · ttft {_fmt_time(s.last_ttft)}" if s.last_ttft else ""
-        lines.append(
-            f"[bold cyan]│[/bold cyan]        [dim]in: {in_tok}{cached_tok} tok · out: {out_tok} tok · "
-            f"{_fmt_time(s.last_step_duration)}{ttft_str}[/dim]"
-        )
+        lines.append(row(
+            f"[dim]  in:{in_tok}{cached_tok} out:{out_tok}[/dim]"
+        ))
+        lines.append(row(
+            f"[dim]  {_fmt_time(s.last_step_duration)}{ttft_str}[/dim]"
+        ))
 
-    # LLM
-    lines.append("[bold cyan]│[/bold cyan]        [dim]│[/dim]")
-    lines.append("[bold cyan]│[/bold cyan]        [dim]▼[/dim]")
-    lines.append(
-        f"[bold cyan]│[/bold cyan]  [bold magenta]LLM[/bold magenta]  [dim]{_trunc(s.model or 'model?', 50)}[/dim]"
-    )
-    base = _trunc(s.base_url.replace("https://", "").replace("http://", ""), 64)
-    if base:
-        lines.append(f"[bold cyan]│[/bold cyan]        [dim]↳ {base}[/dim]")
+    lines.append(row("[dim]  │[/dim]"))
+    lines.append(row("[dim]  ▼[/dim]"))
+    lines.append(row(f"[bold magenta]LLM[/bold magenta] [dim]{_trunc(s.model or '?', tr)}[/dim]"))
 
-    # streaming text or assistant text or thinking placeholder
     if s.is_streaming and s.streaming_text:
-        lines.append(
-            f"[bold cyan]│[/bold cyan]        [green]▍ streaming:[/green] "
-            f"\"{_trunc(s.streaming_text, 60)}\""
-        )
+        lines.append(row(f"[green]▍ {_trunc(s.streaming_text, tr)}[/green]"))
     elif s.is_thinking:
-        lines.append(
-            f"[bold cyan]│[/bold cyan]        [yellow]▍ generating...[/yellow]"
-        )
+        lines.append(row("[yellow]▍ generating...[/yellow]"))
     elif s.last_assistant:
-        lines.append(
-            f"[bold cyan]│[/bold cyan]        [dim]assistant:[/dim] \"{_trunc(s.last_assistant, 60)}\""
-        )
+        lines.append(row(f"[dim]▍ {_trunc(s.last_assistant, tr)}[/dim]"))
 
-    # TOOLS
-    if s.pending_tools or s.finished_tools:
-        lines.append("[bold cyan]│[/bold cyan]        [dim]│[/dim]")
-        lines.append("[bold cyan]│[/bold cyan]        [dim]▼[/dim]")
-        if s.pending_tools:
-            tools_str = ", ".join(s.pending_tools[:6])
-            more = f" +{len(s.pending_tools) - 6}" if len(s.pending_tools) > 6 else ""
-            lines.append(
-                f"[bold cyan]│[/bold cyan]  [bold yellow]TOOLS[/bold yellow] ── ⚙ {tools_str}{more} ──▶"
-            )
-        elif s.finished_tools:
-            tools_str = ", ".join(s.finished_tools[:6])
-            more = f" +{len(s.finished_tools) - 6}" if len(s.finished_tools) > 6 else ""
-            lines.append(
-                f"[bold cyan]│[/bold cyan]  [bold yellow]TOOLS[/bold yellow] ── ✓ {tools_str}{more}[/bold yellow]"
-            )
+    if s.pending_tools:
+        tools_str = ", ".join(s.pending_tools[:3])
+        more = f"+{len(s.pending_tools) - 3}" if len(s.pending_tools) > 3 else ""
+        lines.append(row("[dim]  │[/dim]"))
+        lines.append(row("[dim]  ▼[/dim]"))
+        lines.append(row(
+            f"[bold yellow]TOOLS[/bold yellow] [dim]⚙ {_trunc(tools_str + more, tr - 8)}[/dim]"
+        ))
+    elif s.finished_tools:
+        tools_str = ", ".join(s.finished_tools[:3])
+        more = f"+{len(s.finished_tools) - 3}" if len(s.finished_tools) > 3 else ""
+        lines.append(row("[dim]  │[/dim]"))
+        lines.append(row("[dim]  ▼[/dim]"))
+        lines.append(row(
+            f"[bold yellow]TOOLS[/bold yellow] [dim]✓ {_trunc(tools_str + more, tr - 8)}[/dim]"
+        ))
 
-    # Final answer
     if s.final_answer:
-        lines.append("[bold cyan]│[/bold cyan]        [dim]│[/dim]")
-        lines.append("[bold cyan]│[/bold cyan]        [dim]▼[/dim]")
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [bold green]USER[/bold green]  ◀── \"{_trunc(s.final_answer, 64)}\""
-        )
+        lines.append(row("[dim]  │[/dim]"))
+        lines.append(row("[dim]  ▼[/dim]"))
+        lines.append(row(f"[bold green]USER[/bold green] ◀ \"{_trunc(s.final_answer, tr - 8)}\""))
 
     if s.error:
-        lines.append("[bold cyan]│[/bold cyan]")
-        lines.append(f"[bold cyan]│[/bold cyan]  [bold red]✗ {s.error}[/bold red]")
+        lines.append(blank())
+        lines.append(row(f"[bold red]✗ {s.error[:inner - 2]}[/bold red]"))
 
-    # ─── Detail panel ──────────────────────────────────────────────────────
-    lines.append(f"[bold cyan]│[/bold cyan]")
-    lines.append(f"[bold cyan]│[/bold cyan]  [bold]─── DETAIL ───[/bold]")
+    # ── Detail ──────────────────────────────────────────────────────────
+    lines.append(blank())
+    lines.append(row("[bold]── DETAIL ──[/bold]"))
 
-    # tokens row
+    # Tokens row
     cached_pct = (s.total_cached / s.total_in * 100) if s.total_in else 0
     cache_color = "green" if cached_pct > 30 else ("yellow" if cached_pct > 5 else "dim")
-    lines.append(
-        f"[bold cyan]│[/bold cyan]  [dim]tokens   Σ in:[/dim] {_fmt_tokens(s.total_in)} "
-        f"[{cache_color}](cached: {_fmt_tokens(s.total_cached)} = {cached_pct:.0f}%)[/{cache_color}] "
-        f"[dim]| Σ out:[/dim] {_fmt_tokens(s.total_out)} "
-        f"[dim]| calls:[/dim] {s.total_calls}"
-    )
+    lines.append(row(
+        f"[dim]tok[/dim] {_fmt_tokens(s.total_in)} "
+        f"[{cache_color}]({cached_pct:.0f}%↻)[/{cache_color}]"
+    ))
+    lines.append(row(
+        f"[dim]  out:[/dim] {_fmt_tokens(s.total_out)}  "
+        f"[dim]calls:[/dim] {s.total_calls}"
+    ))
 
-    # cost row
-    lines.append(
-        f"[bold cyan]│[/bold cyan]  [dim]cost     total:[/dim] {_fmt_dollars(s.cost_total)} "
+    # Cost row
+    lines.append(row(
+        f"[dim]$[/dim]  {_fmt_dollars(s.cost_total)} "
         f"[dim](in {_fmt_dollars(s.cost_in)} + out {_fmt_dollars(s.cost_out)})[/dim]"
-    )
+    ))
 
-    # context row with bar
+    # Context row
     if s.context_window:
-        ctx_pct = (s.context_used / s.context_window) if s.context_window else 0
-        ctx_color, ctx_bar = _bar(ctx_pct, length=24)
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [dim]context  ~{_fmt_tokens(s.context_used)} / "
-            f"{_fmt_tokens(s.context_window)} ({ctx_pct * 100:.1f}%)[/dim] "
-            f"[{ctx_color}]{ctx_bar}[/{ctx_color}] [dim]({_fmt_tokens(s.context_window - s.context_used)} free)[/dim]"
-        )
-    else:
-        lines.append(f"[bold cyan]│[/bold cyan]  [dim]context  unknown (set AI_CONTEXT_WINDOW)[/dim]")
+        ctx_pct = s.context_used / s.context_window if s.context_window else 0
+        ctx_color, ctx_bar = _bar(ctx_pct, length=bar_len)
+        lines.append(row(
+            f"[dim]ctx[/dim] {_fmt_tokens(s.context_used)}/{_fmt_tokens(s.context_window)} "
+            f"[{ctx_color}]{ctx_bar}[/{ctx_color}]"
+        ))
+        lines.append(row(f"[dim]    ({ctx_pct * 100:.1f}%)[/dim]"))
 
-    # budget row with bar
+    # Budget row
     if s.budget_limit:
-        bgt_pct = (s.budget_used / s.budget_limit) if s.budget_limit else 0
-        bgt_color, bgt_bar = _bar(bgt_pct, length=24)
-        lines.append(
-            f"[bold cyan]│[/bold cyan]  [dim]budget   {_fmt_tokens(s.budget_used)} / "
-            f"{_fmt_tokens(s.budget_limit)} ({bgt_pct * 100:.1f}%)[/dim] "
+        bgt_pct = s.budget_used / s.budget_limit if s.budget_limit else 0
+        bgt_color, bgt_bar = _bar(bgt_pct, length=bar_len)
+        lines.append(row(
+            f"[dim]bgt[/dim] {_fmt_tokens(s.budget_used)}/{_fmt_tokens(s.budget_limit)} "
             f"[{bgt_color}]{bgt_bar}[/{bgt_color}]"
-        )
+        ))
+        lines.append(row(f"[dim]    ({bgt_pct * 100:.1f}%)[/dim]"))
 
-    # speed row
-    ttft_info = f" · ttft: {_fmt_time(s.last_ttft)}" if s.last_ttft else ""
-    mode = "streaming" if s.is_streaming else "batch"
-    lines.append(
-        f"[bold cyan]│[/bold cyan]  [dim]speed    avg: {s.avg_tokens_per_second:.0f} tok/s · "
-        f"last step: {_fmt_time(s.last_step_duration)}{ttft_info} · "
-        f"elapsed: {_fmt_time(s.elapsed)} · {mode}[/dim]"
-    )
+    # Speed row
+    ttft_info = f" ttft:{_fmt_time(s.last_ttft)}" if s.last_ttft else ""
+    mode = "stream" if s.is_streaming else "batch"
+    lines.append(row(
+        f"[dim]spd[/dim] {s.avg_tokens_per_second:.0f} tok/s "
+        f"[dim]{_fmt_time(s.last_step_duration)}{ttft_info}[/dim]"
+    ))
+    lines.append(row(
+        f"[dim]    {_fmt_time(s.elapsed)} · {mode}[/dim]"
+    ))
 
-    # misc row
+    # Extras row
     misc = []
     if s.externalized:
         misc.append(f"ext:{s.externalized}")
     if s.dedup_hits:
         misc.append(f"dedup:{s.dedup_hits}")
     if s.subagent_calls:
-        misc.append(f"sub-agents:{s.subagent_calls}")
-    misc_str = " · ".join(misc) if misc else "(none)"
-    lines.append(f"[bold cyan]│[/bold cyan]  [dim]extras   {misc_str}[/dim]")
+        misc.append(f"sub:{s.subagent_calls}")
+    misc_str = " · ".join(misc) if misc else "—"
+    lines.append(row(f"[dim]+[/dim] {misc_str}"))
 
-    lines.append(f"[bold cyan]└{'─' * box_w}[/bold cyan]")
+    lines.append(f"[bold cyan]{sep_bot}[/bold cyan]")
 
     return "\n".join(lines)

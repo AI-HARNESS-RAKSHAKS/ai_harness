@@ -26,7 +26,7 @@ def test_renders_user_input():
     assert "USER" in out
     assert "list files in this directory" in out
     assert "chars in" in out
-    assert "DATA FLOW PIPELINE" in out
+    assert "DATA FLOW" in out
 
 
 def test_renders_step_counter():
@@ -38,8 +38,8 @@ def test_renders_step_counter():
 def test_renders_tokens_in_and_out():
     s = _state(step_in=1200, step_out=85)
     out = _render_flow(s)
-    assert "in: 1,200" in out
-    assert "out: 85" in out
+    assert "1,200" in out
+    assert "85" in out
 
 
 def test_renders_pending_tools():
@@ -88,7 +88,7 @@ def test_renders_budget_bar_color_coded_red_when_high():
 def test_renders_streaming_text():
     s = _state(streaming_text="reading the file now")
     out = _render_flow(s)
-    assert "streaming" in out
+    assert "▍" in out
     assert "reading the file now" in out
 
 
@@ -101,7 +101,7 @@ def test_long_input_truncated():
 def test_no_user_input_still_renders():
     s = _state()
     out = _render_flow(s)
-    assert "DATA FLOW PIPELINE" in out
+    assert "DATA FLOW" in out
 
 
 def test_reset_clears_state():
@@ -118,7 +118,7 @@ def test_reset_clears_state():
 def test_renders_cost():
     s = _state(cost_total=0.0042, cost_in=0.0017, cost_out=0.0025)
     out = _render_flow(s)
-    assert "cost" in out
+    assert "$" in out
     assert "$0.0042" in out
     assert "$0.0017" in out
     assert "$0.0025" in out
@@ -127,23 +127,21 @@ def test_renders_cost():
 def test_renders_context_usage():
     s = _state(context_used=5000, context_window=1_048_576)
     out = _render_flow(s)
-    assert "context" in out
+    assert "ctx" in out
     assert "0.5%" in out or "0.4%" in out  # ~0.48%
-    assert "free" in out
 
 
 def test_renders_context_usage_high():
     s = _state(context_used=900_000, context_window=1_000_000)
     out = _render_flow(s)
     assert "90.0%" in out
-    assert "red" in out  # high usage → red bar
+    assert "red" in out
 
 
 def test_renders_speed_metrics():
     s = _state(avg_tokens_per_second=87.5, last_step_duration=1.2, elapsed=4.2)
     out = _render_flow(s)
-    assert "speed" in out
-    # 87.5 rounds to 88 with :.0f
+    assert "spd" in out
     assert "88 tok/s" in out
     assert "1.2s" in out
     assert "4.2s" in out
@@ -152,7 +150,7 @@ def test_renders_speed_metrics():
 def test_renders_cached_tokens_with_color():
     s = _state(total_in=1000, total_cached=500)
     out = _render_flow(s)
-    assert "cached" in out
+    assert "%↻" in out  # compact cache indicator
     assert "50%" in out
 
 
@@ -165,7 +163,7 @@ def test_renders_dedup_hits():
 def test_renders_subagent_calls():
     s = _state(subagent_calls=2)
     out = _render_flow(s)
-    assert "sub-agents:2" in out
+    assert "sub:2" in out
 
 
 def test_renders_externalized_count():
@@ -177,19 +175,19 @@ def test_renders_externalized_count():
 def test_renders_extras_none_when_empty():
     s = _state()
     out = _render_flow(s)
-    assert "(none)" in out
+    assert "—" in out
 
 
 def test_step_cached_displayed():
     s = _state(step_in=1000, step_out=50, step_cached=400)
     out = _render_flow(s)
-    assert "(cached 400)" in out
+    assert "/c400" in out
 
 
 def test_detail_section_present():
     s = _state()
     out = _render_flow(s)
-    assert "─── DETAIL ───" in out
+    assert "── DETAIL ──" in out
 
 
 def test_cost_zero_displayed():

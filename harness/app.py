@@ -1,16 +1,30 @@
-"""Textual TUI for the AI Harness."""
+"""Textual TUI for the AI Harness.
+
+Layout:
+  ┌── status bar (top, 1 line) ───────────────────────────────────┐
+  │                                                              │
+  │  ┌── main log (left, takes remaining space) ──┐ ┌── flow ─┐│
+  │  │                                            │ │ panel  ││
+  │  │  user input + tool calls + final answer    │ │ (right ││
+  │  │                                            │ │ side)  ││
+  │  │                                            │ │        ││
+  │  └────────────────────────────────────────────┘ └────────┘│
+  │                                                              │
+  ├── input box (bottom) ────────────────────────────────────────┤
+  └── footer ────────────────────────────────────────────────────┘
+"""
 
 from __future__ import annotations
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Input, RichLog, Static
 
 from . import tools
 from .agent import Agent, AgentEvent
 from .config import load_config
-from .flow import FlowPanel, FlowState
+from .flow import DEFAULT_SIDEBAR_WIDTH, FlowPanel, FlowState
 from .llm import LLMClient
 from .optimize import ToolOutputStore
 from .pricing import get_context_window
@@ -28,20 +42,24 @@ class HarnessApp(App):
         color: #8b949e;
         padding: 0 1;
     }
-    #flow {
-        dock: top;
-        height: auto;
-        max-height: 26;
-        background: #0d1117;
-        color: #c9d1d9;
-        border: round #30363d;
-        padding: 0 1;
+    #main {
+        height: 1fr;
+        width: 1fr;
     }
     #log {
         background: #0e1117;
         color: #c9d1d9;
         border: round #30363d;
         padding: 1 2;
+    }
+    #flow {
+        dock: right;
+        width: 46;
+        background: #0d1117;
+        color: #c9d1d9;
+        border: round #30363d;
+        padding: 0 0;
+        margin: 0 1 0 0;
     }
     #input {
         dock: bottom;
@@ -60,6 +78,7 @@ class HarnessApp(App):
         Binding("ctrl+r", "reset", "Reset"),
         Binding("ctrl+k", "compact", "Compact"),
         Binding("ctrl+d", "toggle_flow", "Hide/Show flow"),
+        Binding("ctrl+b", "toggle_sidebar", "Dock bottom"),
     ]
 
     TITLE = "AI Harness"
@@ -81,17 +100,22 @@ class HarnessApp(App):
             budget_limit=self.config.token_budget,
             max_steps=self.config.max_steps,
             context_window=ctx_window,
+            sidebar_width=DEFAULT_SIDEBAR_WIDTH,
         )
         self.client = LLMClient(self.config)
         self.agent = Agent(self.config, self.client, observer=self._observe)
         self._busy = False
         self._flow_visible = True
+        self._sidebar_docked = "right"
 
     def compose(self) -> ComposeResult:
         yield Static(self._status_text("ready"), id="status")
-        yield FlowPanel(self.flow_state)
-        with Vertical():
-            yield RichLog(id="log", wrap=True, highlight=True, markup=True, max_lines=5000)
+        with Horizontal():
+            with Vertical(id="main"):
+                yield RichLog(
+                    id="log", wrap=True, highlight=True, markup=True, max_lines=5000
+                )
+            yield FlowPanel(self.flow_state)
         yield Input(
             placeholder="Describe a task... (Enter submit · Ctrl+D hide flow · Ctrl+C quit)",
             id="input",
@@ -106,11 +130,11 @@ class HarnessApp(App):
         mode = "stream" if self.agent.streaming else "batch"
         return (
             f"model: {self.config.model}   "
-            f"tokens: in {u.input_tokens} (cached {u.cached_input_tokens}) | out {u.output_tokens}   "
-            f"cost: ${cost:.4f}   "
-            f"budget: {b.used}/{b.limit} ({pct}%)   "
-            f"mode: {mode}   "
-            f"state: {state}"
+            f"in {u.input_tokens} (cached {u.cached_input_tokens}) | out {u.output_tokens}   "
+            f"cost ${cost:.4f}   "
+            f"budget {b.used}/{b.limit} ({pct}%)   "
+            f"mode {mode}   "
+            f"{state}"
         )
 
     def on_mount(self) -> None:
@@ -118,12 +142,18 @@ class HarnessApp(App):
         log.write("[bold cyan]AI Harness[/bold cyan] [dim]- text-only coding agent[/dim]")
         log.write(f"[dim]Model: {self.config.model}   Base: {self.config.base_url}[/dim]")
         ctx = get_context_window(self.config.model)
-        log.write(f"[dim]Context window: {ctx:,} tok · Budget: {self.config.token_budget:,} tok · "
-                  f"Sub-agent: {self.config.subagent_model or '(inherit)'} · Parallel: {self.config.parallel_tools}[/dim]")
         log.write(
-            f"[dim]Auto-retry: 408/409/425/429/500/502/503/504 with exp backoff (5 attempts, honours Retry-After).[/dim]"
+            f"[dim]Context: {ctx:,} tok · Budget: {self.config.token_budget:,} tok · "
+            f"Sub-agent: {self.config.subagent_model or '(inherit)'} · "
+            f"Parallel: {self.config.parallel_tools}[/dim]"
         )
-        log.write("[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact · Ctrl+D hide flow · Ctrl+C quit[/dim]\n")
+        log.write(
+            "[dim]Auto-retry: 408/409/425/429/500/502/503/504 (5 attempts, honours Retry-After).[/dim]"
+        )
+        log.write(
+            "[dim]Shortcuts: Ctrl+L clear · Ctrl+R reset · Ctrl+K compact · "
+            "Ctrl+D hide flow · Ctrl+B dock bottom · Ctrl+C quit[/dim]\n"
+        )
 
     # --- FlowPanel observer (runs synchronously, never raises) ---------------
 
@@ -160,7 +190,6 @@ class HarnessApp(App):
             s.is_thinking = False
             text = ev.payload.get("text", "")
             s.streaming_text += text
-            # Cap at 500 chars to avoid runaway memory on long streams
             if len(s.streaming_text) > 1000:
                 s.streaming_text = "…" + s.streaming_text[-500:]
         elif ev.type == "assistant":
@@ -194,7 +223,6 @@ class HarnessApp(App):
             s.error = ev.payload.get("message", "error")
             s.is_thinking = False
 
-        # Pull aggregate counters from the agent
         s.total_in = self.agent.usage.input_tokens
         s.total_out = self.agent.usage.output_tokens
         s.total_cached = self.agent.usage.cached_input_tokens
@@ -258,10 +286,12 @@ class HarnessApp(App):
                 tok = ev.payload.get("step_out", 0)
                 tps = ev.payload.get("tokens_per_second", 0.0)
                 cost = ev.payload.get("step_cost", 0.0)
+                ttft = ev.payload.get("ttft", 0.0)
                 dur_s = f"{dur:.1f}s" if dur >= 1 else f"{int(dur * 1000)}ms"
+                ttft_s = f"{int(ttft * 1000)}ms" if ttft else "—"
                 log.write(
                     f"[bold magenta]assistant[/bold magenta] "
-                    f"[dim]({dur_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{content}"
+                    f"[dim]({dur_s} · ttft {ttft_s} · {tok} tok · {tps:.0f} tok/s · ${cost:.4f})[/dim]\n{content}"
                 )
             return
         if ev.type == "tool_call":
@@ -323,6 +353,26 @@ class HarnessApp(App):
             self.query_one("#flow", FlowPanel).display = self._flow_visible
         except Exception:
             pass
+
+    async def action_toggle_sidebar(self) -> None:
+        """Toggle FlowPanel between right-side dock and bottom dock."""
+        try:
+            flow = self.query_one("#flow", FlowPanel)
+        except Exception:
+            return
+        # Remove existing style and apply new dock
+        flow.set_class(False, "docked-right", "docked-bottom")
+        if self._sidebar_docked == "right":
+            self._sidebar_docked = "bottom"
+            flow.set_class(True, "docked-bottom")
+            flow.styles.width = "100%"
+            flow.styles.height = "30%"
+            flow.styles.dock = "bottom"
+        else:
+            self._sidebar_docked = "right"
+            flow.styles.width = "46"
+            flow.styles.height = "100%"
+            flow.styles.dock = "right"
 
     async def on_unmount(self) -> None:
         await self.client.aclose()
